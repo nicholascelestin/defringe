@@ -21,7 +21,7 @@ from skimage.filters import scharr
 from scipy.ndimage import (gaussian_filter, maximum_filter, binary_erosion,
                            distance_transform_edt, label)
 
-from ._common import to_lab, lab_to_rgb, hue_weight, blur, normconv
+from ._common import to_lab, lab_to_rgb, hue_weight, blur, normconv, soft_step
 
 # Target fringe hue in Lab (a = green<->magenta, b = blue<->yellow).
 # -45deg magenta-violet: centred on real axial CA, rejecting warm-red (b>0) and
@@ -61,6 +61,12 @@ DEFAULTS = dict(
     normalize=True,       # re-centre residual onto local tone (kills brown bias)
     passes=2,             # repair iterations (field detected once, reused)
     pass_decay=0.6,       # amplitude multiplier per extra pass (gentler each time)
+    # soft decision widths (0 = hard threshold, identical to before; raise to
+    # trade a little selectivity for temporal stability / less flicker). Baked
+    # to the levels tuned in the app for purple flicker reduction.
+    edge_soft=0.45,       # edge percentile ramp (fraction of the threshold)
+    anom_soft=0.0,        # anomaly-interior ramp (Lab chroma units)
+    bright_soft=8.0,      # bright-side L* ramp (L* units)
 )
 
 
@@ -80,18 +86,35 @@ def detect(rgb, **kw):
     detected = np.minimum(maximum_filter(anomaly, size=p["spread_win"]), presence)
 
     edge = scharr(L)
-    strong = edge > np.percentile(edge, p["edge_pct"])
-    lab_id, n = label(strong)
+    thr = np.percentile(edge, p["edge_pct"])
+    # soft edge band around the (still global) percentile: pixels near the
+    # threshold fade rather than flip, damping the frame-wide percentile breathing
+    edge_w = soft_step(edge, thr, p["edge_soft"] * thr)
+    lab_id, n = label(edge_w > 0)
     if n:
         sizes = np.bincount(lab_id.ravel()); sizes[0] = 0
-        strong = (sizes >= p["min_edge"])[lab_id]
-    interior = binary_erosion(anomaly > p["anomaly_thr"], iterations=p["int_erode"])
-    gate = strong & ~interior
+        edge_w = edge_w * (sizes >= p["min_edge"])[lab_id]
+    # interior of coloured blobs to subtract. Soft path = blur + ramp; width=0
+    # falls back to the exact original binary erosion.
+    if p["anom_soft"] > 0:
+        interior_w = soft_step(gaussian_filter(anomaly, float(p["int_erode"]) + 1.0),
+                               p["anomaly_thr"], p["anom_soft"])
+    else:
+        interior_w = binary_erosion(anomaly > p["anomaly_thr"],
+                                    iterations=p["int_erode"]).astype(np.float32)
+    gate_w = edge_w * (1.0 - interior_w)
     if p["require_bright"]:
-        gate = gate & (maximum_filter(L, size=p["bright_win"]) > p["bright_L"])
+        gate_w = gate_w * soft_step(maximum_filter(L, size=p["bright_win"]),
+                                    p["bright_L"], p["bright_soft"])
 
-    dist = distance_transform_edt(~gate)
-    reach = np.exp(-(dist ** 2) / (2.0 * p["tol"] ** 2))
+    gate = gate_w > 0
+    if (p["edge_soft"] or p["bright_soft"] or p["anom_soft"]) and gate.any():
+        # propagate the soft gate strength from each pixel's nearest gate pixel
+        dist, (iy, ix) = distance_transform_edt(~gate, return_indices=True)
+        reach = np.exp(-(dist ** 2) / (2.0 * p["tol"] ** 2)) * gate_w[iy, ix]
+    else:
+        dist = distance_transform_edt(~gate)
+        reach = np.exp(-(dist ** 2) / (2.0 * p["tol"] ** 2))
     darkside = np.clip((p["fill_L_hi"] - L) / p["fill_L_soft"], 0, 1)
     field = detected * reach * darkside
 

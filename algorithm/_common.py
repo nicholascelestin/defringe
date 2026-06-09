@@ -24,6 +24,27 @@ def composite(out_float, src_float, alpha):
     return np.where((alpha > 0)[..., None], out_float, src_float).astype(np.uint8)
 
 
+def soft_step(x, thr, width):
+    """Smooth 0->1 ramp centred at `thr`, reaching 0/1 exactly at thr-+width.
+
+    A drop-in soft replacement for a hard `x > thr` boolean: a value near the
+    threshold contributes partially and varies *continuously* as the input
+    jitters, instead of flipping 0<->1 frame to frame (the main flicker source).
+    Smoothstep (not logistic) so it is exactly 0 below the band and 1 above it,
+    preserving sparsity and the bit-exact `alpha == 0` passthrough. `width <= 0`
+    recovers the hard step (x > thr) at the input's own precision, so a width=0
+    pass is bit-identical to the original comparison. Output is float32 to match
+    the float32 Lab pipeline (a float64 weight would silently upcast downstream
+    blurs and perturb results at float32 epsilon). `thr` and `width` may be
+    scalars or arrays broadcastable to `x` (e.g. a per-component limit)."""
+    x = np.asarray(x)                                      # compare at native precision
+    width = np.asarray(width, np.float64)
+    safe_w = np.where(width > 0, width, 1.0)               # avoid /0 where hard
+    t = np.clip((x - thr) / (2.0 * safe_w) + 0.5, 0.0, 1.0)
+    smooth = t * t * (3.0 - 2.0 * t)
+    return np.where(width > 0, smooth, x > thr).astype(np.float32)
+
+
 def hue_weight(va, vb, target, power):
     """Chroma magnitude weighted by how closely (va,vb) points at `target`."""
     ta, tb = target
