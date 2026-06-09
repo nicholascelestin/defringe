@@ -1,0 +1,48 @@
+# --- project-specific ---
+.venv/                  # 370M+ uv venv; recreate with uv, don't commit
+*.log                   # app.log, app.run.log, etc.
+trash/                  # scratch / deprecated code
+
+# Video media (the source/*.mp4 is a symlink to a file outside the repo, and any
+# clips written by delivery/defringe_video.py are large build outputs). Keep the
+# small still test fixtures (source/*.webp, *.png) tracked.
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.m4v
+*.ts
+*.mpg
+*.mpeg
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.installed.cfg
+
+# Virtual envs (other common names)
+venv/
+env/
+ENV/
+.env
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
