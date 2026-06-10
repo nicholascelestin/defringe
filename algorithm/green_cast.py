@@ -44,6 +44,11 @@ DEFAULTS = dict(
     # jitter on frames 235-246, with only a small coverage increase.
     area_soft=0.4,      # min_area ramp (fraction of min_area)
     radius_soft=0.4,    # cast_radius distance falloff (fraction of cast_radius)
+    # directional repair: bias the local-tone estimate AWAY from the caster, so
+    # green chroma is pulled toward the clean down-cast side rather than back
+    # toward the (high-chroma, fully-trusted) red source. 0 = isotropic tone
+    # estimate (byte-identical to before); 1 = caster-side donors fully suppressed.
+    tone_directionality=0.5,
 )
 
 
@@ -72,6 +77,7 @@ def green_cast(rgb, *, return_debug=False, **kw):
 
     keepS = np.zeros_like(chroma, np.float32)
     caster_big = np.zeros_like(chroma, bool)
+    donor = np.ones_like(chroma, np.float32)   # tone-donor trust weight (1 = trusted)
     lbl, n = label(caster)
     if n:
         areas = np.bincount(lbl.ravel()); areas[0] = 0
@@ -93,14 +99,22 @@ def green_cast(rgb, *, return_debug=False, **kw):
         # every green candidate within reach is a cast shadow (no size gate),
         # weighted by the nearest caster's area
         keepS = cand.astype(np.float32) * caster_w[lbl[iy, ix]] * radius_w
+        # directional repair: down-weight donors on the caster side. `far` is a
+        # 0->1 ramp in distance-from-caster (0 at the caster, 1 by ~2*cast_radius),
+        # so donor is small near the source and ~1 on the clean down-cast side.
+        # dir=0 leaves donor==1 -> the tone estimate stays byte-identical.
+        if p["tone_directionality"] > 0:
+            far = soft_step(dist, p["cast_radius"], p["cast_radius"])
+            donor = (1.0 - p["tone_directionality"] * (1.0 - far)).astype(np.float32)
 
     # 4. chroma-weighted alpha: spatially grow (dilate), feather, cap
     abase = keepS * np.clip((chroma - p["green_chr"]) / max(p["full_strength_span"], 1e-3), 0, 1)
     if p["repair_spread"] > 0:
         abase = maximum_filter(abase, size=int(2 * p["repair_spread"] + 1))
     alpha = np.clip(gaussian_filter(abase, p["feather"]), 0, p["max_strength"])
-    # 5. repair: pull green chroma to the local (trust-weighted) tone; keep L
-    trust = (1 - alpha) + 1e-3
+    # 5. repair: pull green chroma to the local (trust-weighted) tone; keep L.
+    # `donor` adds the directional bias away from the caster (1 everywhere if off).
+    trust = ((1 - alpha) + 1e-3) * donor
     den = gaussian_filter(trust, p["tone_correction_radius"]) + 1e-6
     ta = gaussian_filter(a * trust, p["tone_correction_radius"]) / den
     tb = gaussian_filter(b * trust, p["tone_correction_radius"]) / den

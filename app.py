@@ -58,9 +58,10 @@ def current_frame(source, clip, idx):
 def run_chain(source, clip, idx,
               g_on, cast_chr, band_lo, band_hi, glo, ghi, gchr, radius,
               minar, fspan, amax, grow, feather, gtone,
-              g_area_soft, g_radius_soft,
+              g_area_soft, g_radius_soft, g_tdir,
               pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-              pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone):
+              pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir,
+              pc_relgate, pc_relthr):
     """frame -> [green] -> [purple] (casting-shadow model: bright highlight =
     caster, magenta = shadow). Returns all ten image/stat outputs."""
     rgb = current_frame(source, clip, idx)
@@ -75,7 +76,7 @@ def run_chain(source, clip, idx,
             green_lo=glo, green_hi=ghi, green_chr=gchr,
             cast_radius=int(radius), min_area=int(minar), full_strength_span=fspan,
             max_strength=amax, repair_spread=int(grow), feather=feather, tone_correction_radius=gtone,
-            area_soft=g_area_soft, radius_soft=g_radius_soft)
+            area_soft=g_area_soft, radius_soft=g_radius_soft, tone_directionality=g_tdir)
         dm = 0.45 * rgb
         if ginfo["caster"].any():
             dm[ginfo["caster"]] = 0.5 * dm[ginfo["caster"]] + 0.5 * np.array([230., 60., 50.])
@@ -93,7 +94,8 @@ def run_chain(source, clip, idx,
             gout, bright_L=pc_bright, min_area=int(pc_minar), area_soft=pc_area_soft,
             cast_radius=int(pc_radius), radius_soft=pc_radius_soft, mag_chr=pc_chr,
             mag_lo=pc_lo, mag_hi=pc_hi, full_strength_span=pc_fspan, max_strength=pc_amax,
-            repair_spread=int(pc_grow), feather=pc_feather, tone_correction_radius=pc_tone)
+            repair_spread=int(pc_grow), feather=pc_feather, tone_correction_radius=pc_tone,
+            tone_directionality=pc_tdir, rel_gate=bool(pc_relgate), rel_thresh=pc_relthr)
         dm = 0.45 * gout
         if pcinfo["caster"].any():
             dm[pcinfo["caster"]] = 0.5 * dm[pcinfo["caster"]] + 0.5 * np.array([255., 215., 0.])
@@ -194,9 +196,10 @@ def _stage_metrics(out, inp, alphas, n):
 def temporal_analyze(source, clip, idx,
               g_on, cast_chr, band_lo, band_hi, glo, ghi, gchr, radius,
               minar, fspan, amax, grow, feather, gtone,
-              g_area_soft, g_radius_soft,
+              g_area_soft, g_radius_soft, g_tdir,
               pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-              pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone):
+              pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir,
+              pc_relgate, pc_relthr):
     """Run the live pipeline (green -> purple cast) over the current frame + next 5; report flicker."""
     if source != "extracted clip" or clip is None or len(clip) == 0:
         return None, None, "Select an **extracted clip** in Tab 0 first.", None
@@ -214,7 +217,7 @@ def temporal_analyze(source, clip, idx,
                 green_lo=glo, green_hi=ghi, green_chr=gchr,
                 cast_radius=int(radius), min_area=int(minar), full_strength_span=fspan,
                 max_strength=amax, repair_spread=int(grow), feather=feather, tone_correction_radius=gtone,
-                area_soft=g_area_soft, radius_soft=g_radius_soft)
+                area_soft=g_area_soft, radius_soft=g_radius_soft, tone_directionality=g_tdir)
             galpha = ginfo["alpha"]
         else:
             gout, galpha = fr, np.zeros(fr.shape[:2], np.float32)
@@ -223,7 +226,8 @@ def temporal_analyze(source, clip, idx,
                 gout, bright_L=pc_bright, min_area=int(pc_minar), area_soft=pc_area_soft,
                 cast_radius=int(pc_radius), radius_soft=pc_radius_soft, mag_chr=pc_chr,
                 mag_lo=pc_lo, mag_hi=pc_hi, full_strength_span=pc_fspan, max_strength=pc_amax,
-                repair_spread=int(pc_grow), feather=pc_feather, tone_correction_radius=pc_tone)
+                repair_spread=int(pc_grow), feather=pc_feather, tone_correction_radius=pc_tone,
+                tone_directionality=pc_tdir, rel_gate=bool(pc_relgate), rel_thresh=pc_relthr)
             palpha = pinfo["alpha"]
         else:
             pout, palpha = gout, np.zeros(np.asarray(gout).shape[:2], np.float32)
@@ -261,12 +265,17 @@ def temporal_analyze(source, clip, idx,
 def export_onnx(source, clip, idx,
                 g_on, cast_chr, band_lo, band_hi, glo, ghi, gchr, radius,
                 minar, fspan, amax, grow, feather, gtone,
-                g_area_soft, g_radius_soft,
+                g_area_soft, g_radius_soft, g_tdir,
                 pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-                pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone,
+                pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir,
+                pc_relgate, pc_relthr,
                 progress=gr.Progress()):
     """Export green->purple_cast to ONNX (opset 17) using the LIVE slider settings.
     A disabled pass (toggle off) is exported as a no-op via max_strength=0."""
+    if pc_relgate:
+        return ("⚠️ The experimental **Relative magenta gate** is ON but is not yet "
+                "implemented in the ONNX port — the export would silently use the absolute "
+                "hue band instead. Turn it off to export, or ask to sync it to the port first.")
     progress(0.05, desc="loading torch...")
     try:
         import torch
@@ -279,12 +288,13 @@ def export_onnx(source, clip, idx,
     green = dict(cast_chr=cast_chr, band_lo=band_lo, band_hi=band_hi, green_lo=glo, green_hi=ghi,
                  green_chr=gchr, cast_radius=radius, min_area=minar, full_strength_span=fspan,
                  max_strength=(amax if g_on else 0.0), repair_spread=grow, feather=feather,
-                 tone_correction_radius=gtone, area_soft=g_area_soft, radius_soft=g_radius_soft)
+                 tone_correction_radius=gtone, area_soft=g_area_soft, radius_soft=g_radius_soft,
+                 tone_directionality=g_tdir)
     purple = dict(bright_L=pc_bright, min_area=pc_minar, area_soft=pc_area_soft,
                   cast_radius=pc_radius, radius_soft=pc_radius_soft, mag_chr=pc_chr,
                   mag_lo=pc_lo, mag_hi=pc_hi, full_strength_span=pc_fspan,
                   max_strength=(pc_amax if pc_on else 0.0), repair_spread=pc_grow,
-                  feather=pc_feather, tone_correction_radius=pc_tone)
+                  feather=pc_feather, tone_correction_radius=pc_tone, tone_directionality=pc_tdir)
     progress(0.3, desc="building model from current settings...")
     model = Defringe(green=green, purple=purple).eval()
     dummy = torch.zeros(1, 540, 960, 3, dtype=torch.uint8)
@@ -393,6 +403,7 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 g_grow = S(0, 20, G["repair_spread"], 1, "Repair Spread", "Expand the corrected region outward by this many px before feathering.")
                 g_feather = S(0, 5, G["feather"], 0.1, "Feather", "Alpha feather sigma (px). Softens the edge and slightly spreads it.")
                 g_tone = S(5, 50, G["tone_correction_radius"], 1, "Tone Correction Radius", "Radius (px) for estimating the local tone that green chroma is pulled toward (L* kept).")
+                g_tdir = S(0, 1, G["tone_directionality"], 0.05, "Tone Directionality", "Bias the repair-tone estimate away from the caster. 0 = sample tone evenly from all directions (old behavior); 1 = mostly ignore donors on the caster side, pulling repair tone from the cast (down-shadow) direction.")
             with gr.Column(scale=2):
                 t1_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", visible=False)
                 g_stat = gr.Textbox(label="stats", interactive=False)
@@ -421,6 +432,10 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 pc_grow = S(0, 20, PC["repair_spread"], 1, "Repair Spread", "Expand the corrected region outward by this many px before feathering.")
                 pc_feather = S(0, 5, PC["feather"], 0.1, "Feather", "Alpha feather sigma (px).")
                 pc_tone = S(5, 50, PC["tone_correction_radius"], 1, "Tone Correction Radius", "Radius (px) for estimating the local tone the magenta chroma is pulled toward (L* kept).")
+                pc_tdir = S(0, 1, PC["tone_directionality"], 0.05, "Tone Directionality", "Bias the repair-tone estimate away from the caster (blown highlight). 0 = sample tone evenly from all directions (old behavior); 1 = mostly ignore donors on the caster side, pulling repair tone from the cast (fringe) direction.")
+                gr.Markdown("**Experimental**")
+                pc_relgate = gr.Checkbox(PC["rel_gate"], label="Relative magenta gate (vs lighting tone)", info="Detect fringe as a magenta EXCESS over the scene's overall lighting tone (warm↔cool) — the luminance-weighted global mean of a*/b* — instead of the absolute [Hue Floor, Hue Ceiling] band. A warm-lit scene shifts the reference warm, so genuinely warm content collapses to it while magenta fringe (blue-shifted, opposite the warm axis) stands out. When ON, Hue Floor/Ceiling are ignored and Relative Excess drives detection. NOT yet in the ONNX export.")
+                pc_relthr = S(0, 20, PC["rel_thresh"], 0.5, "Relative Excess", "Minimum magenta-excess-over-lighting-tone (in CIELAB chroma units) to flag a pixel as fringe (relative gate only). Higher = stricter; only pixels clearly more magenta than the scene's overall tone are corrected.")
             with gr.Column(scale=2):
                 t2_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", visible=False)
                 pc_stat = gr.Textbox(label="stats", interactive=False)
@@ -461,9 +476,10 @@ with gr.Blocks(title="Defringe tuner") as demo:
     ins = [t0_source, clip_state, t0_frame,
            g_on, g_cast_chr, g_band_lo, g_band_hi, g_glo, g_ghi, g_gchr,
            g_radius, g_minar, g_fspan, g_amax, g_grow, g_feather, g_tone,
-           g_area_soft, g_radius_soft,
+           g_area_soft, g_radius_soft, g_tdir,
            pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-           pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone]
+           pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir,
+           pc_relgate, pc_relthr]
     outs = [g_compare, g_detect, g_alpha, g_stat,
             pc_compare, pc_detect, pc_alpha, pc_stat]
 

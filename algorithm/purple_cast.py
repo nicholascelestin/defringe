@@ -23,7 +23,7 @@ MAGENTA_REF = 315.0
 DEFAULTS = dict(
     bright_L=88.0,      # caster: min L* for a near-white (blown highlight) source
     mag_lo=-15.0,       # shadow hue band, signed deg from magenta (MAGENTA_REF):
-    mag_hi=30.0,        #   blue/violet edge .. magenta/red edge
+    mag_hi=50.0,        #   blue/violet edge .. magenta/red edge
     mag_chr=6.8,        # magenta chroma floor (lower = catches fainter fringe)
     cast_radius=8,      # reach from the highlight edge to search for fringe (px)
     min_area=10,        # ignore caster (highlight) blobs smaller than this (px)
@@ -34,6 +34,19 @@ DEFAULTS = dict(
     tone_correction_radius=16.0, # local-tone estimate radius (px)
     area_soft=0.4,      # min_area ramp (fraction of min_area)
     radius_soft=0.4,    # cast_radius distance falloff (fraction of cast_radius)
+    # directional repair: bias the local-tone estimate AWAY from the caster, so
+    # magenta chroma is pulled toward the clean down-cast side rather than back
+    # toward the (fully-trusted) blown highlight. 0 = isotropic tone estimate
+    # (byte-identical to before); 1 = caster-side donors fully suppressed.
+    tone_directionality=0.5,
+    # EXPERIMENTAL relative gate: detect fringe as a magenta EXCESS over the scene's
+    # overall LIGHTING TONE (warm<->cool), not an absolute hue band [mag_lo,mag_hi].
+    # The reference is the luminance-weighted global mean of a*/b*, so a warm-lit
+    # scene shifts it warm and genuinely warm content cancels while magenta fringe
+    # (blue-shifted) stands out -- fixing the scene-dependent mag_hi overshoot. Off
+    # -> byte-identical to the hue-band detector. See memory directional-repair note.
+    rel_gate=False,
+    rel_thresh=4.0,     # min magenta-excess-over-lighting-tone to flag (rel_gate only)
 )
 
 
@@ -53,11 +66,32 @@ def purple_cast(rgb, **kw):
 
     # 1. casters: near-white blown highlights (the physical axial-CA source)
     caster = L > p["bright_L"]
-    # 2. magenta-violet fringe candidates
-    mag = (chroma > p["mag_chr"]) & (ms >= p["mag_lo"]) & (ms <= p["mag_hi"])
+    # 2. magenta-violet fringe candidates. Two gates (strength ramp matches the gate):
+    #  - absolute (default): hue in the fixed band [mag_lo,mag_hi]; ramp on chroma.
+    #  - relative (rel_gate): pixel is more magenta than its local ambient tone, i.e.
+    #    a magenta EXCESS over the surroundings -> warm ambient cancels; ramp on excess.
+    if p["rel_gate"]:
+        um_a, um_b = np.cos(np.radians(MAGENTA_REF)), np.sin(np.radians(MAGENTA_REF))
+        # reference = the scene's overall lighting tone (warm<->cool cast): the
+        # luminance-weighted mean of a*/b* over lit, non-clipped pixels, so brightly
+        # lit surfaces set it and blown highlights (achromatic) are excluded. One
+        # global (a_ref,b_ref) per frame -> temporally stable, unlike a local blur.
+        # Magenta fringe is blue-shifted (-b*) while warm content is yellow (+b*), so
+        # subtracting a warm cast makes fringe stand out and warm content collapse.
+        w = L * (L < p["bright_L"])
+        wsum = float(w.sum()) + 1e-6
+        a_ref = float((w * a).sum() / wsum)
+        b_ref = float((w * b).sum() / wsum)
+        mexcess = (a - a_ref) * um_a + (b - b_ref) * um_b    # magenta excess over the lighting tone
+        mag = (chroma > p["mag_chr"]) & (mexcess > p["rel_thresh"])
+        strength = np.clip((mexcess - p["rel_thresh"]) / max(p["full_strength_span"], 1e-3), 0, 1)
+    else:
+        mag = (chroma > p["mag_chr"]) & (ms >= p["mag_lo"]) & (ms <= p["mag_hi"])
+        strength = np.clip((chroma - p["mag_chr"]) / max(p["full_strength_span"], 1e-3), 0, 1)
 
     keepS = np.zeros_like(chroma, np.float32)
     caster_big = np.zeros_like(chroma, bool)
+    donor = np.ones_like(chroma, np.float32)   # tone-donor trust weight (1 = trusted)
     lbl, n = label(caster)
     if n:
         areas = np.bincount(lbl.ravel()); areas[0] = 0
@@ -76,14 +110,22 @@ def purple_cast(rgb, **kw):
         # every magenta candidate within reach is a cast fringe, weighted by the
         # nearest highlight's area
         keepS = cand.astype(np.float32) * caster_w[lbl[iy, ix]] * radius_w
+        # directional repair: down-weight donors on the caster side. `far` is a
+        # 0->1 ramp in distance-from-caster (0 at the caster, 1 by ~2*cast_radius),
+        # so donor is small near the highlight and ~1 on the clean down-cast side.
+        # dir=0 leaves donor==1 -> the tone estimate stays byte-identical.
+        if p["tone_directionality"] > 0:
+            far = soft_step(dist, p["cast_radius"], p["cast_radius"])
+            donor = (1.0 - p["tone_directionality"] * (1.0 - far)).astype(np.float32)
 
     # 4. chroma-weighted alpha: spatially grow (dilate), feather, cap
-    abase = keepS * np.clip((chroma - p["mag_chr"]) / max(p["full_strength_span"], 1e-3), 0, 1)
+    abase = keepS * strength
     if p["repair_spread"] > 0:
         abase = maximum_filter(abase, size=int(2 * p["repair_spread"] + 1))
     alpha = np.clip(gaussian_filter(abase, p["feather"]), 0, p["max_strength"])
-    # 5. repair: pull magenta chroma to the local (trust-weighted) tone; keep L
-    trust = (1 - alpha) + 1e-3
+    # 5. repair: pull magenta chroma to the local (trust-weighted) tone; keep L.
+    # `donor` adds the directional bias away from the caster (1 everywhere if off).
+    trust = ((1 - alpha) + 1e-3) * donor
     den = gaussian_filter(trust, p["tone_correction_radius"]) + 1e-6
     ta = gaussian_filter(a * trust, p["tone_correction_radius"]) / den
     tb = gaussian_filter(b * trust, p["tone_correction_radius"]) / den

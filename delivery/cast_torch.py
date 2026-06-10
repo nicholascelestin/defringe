@@ -110,7 +110,13 @@ class Defringe(nn.Module):
             abase = self._dilate(abase, int(2 * P["repair_spread"] + 1))
         alpha = self._sep(abase, getattr(self, f"k_{tag}_feather"),
                           getattr(self, f"r_{tag}_feather")).clamp(0, P["max_strength"])
+        # directional repair (cf. numpy `donor`): down-weight tone donors on the
+        # caster side. `reach` approximates caster-nearness (~1 over the caster and
+        # its reach, ~0 on the clean down-cast side), so multiplying it out of the
+        # trust biases the tone estimate away from the source. dir=0 -> unchanged.
         trust = (1.0 - alpha) + 1e-3
+        if P["tone_directionality"] > 0:
+            trust = trust * (1.0 - P["tone_directionality"] * reach)
         kt, rt = getattr(self, f"k_{tag}_tone"), getattr(self, f"r_{tag}_tone")
         den = self._sep(trust, kt, rt) + 1e-6
         ta = self._sep(a * trust, kt, rt) / den
