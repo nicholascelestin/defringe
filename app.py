@@ -60,8 +60,7 @@ def run_chain(source, clip, idx,
               minar, fspan, amax, grow, feather, gtone,
               g_area_soft, g_radius_soft, g_tdir,
               pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-              pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir,
-              pc_relgate, pc_relthr):
+              pc_chr, pc_thue, pc_relthr, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir):
     """frame -> [green] -> [purple] (casting-shadow model: bright highlight =
     caster, magenta = shadow). Returns all ten image/stat outputs."""
     rgb = current_frame(source, clip, idx)
@@ -93,9 +92,9 @@ def run_chain(source, clip, idx,
         pcout, pcinfo = alg.purple_cast(
             gout, bright_L=pc_bright, min_area=int(pc_minar), area_soft=pc_area_soft,
             cast_radius=int(pc_radius), radius_soft=pc_radius_soft, mag_chr=pc_chr,
-            mag_lo=pc_lo, mag_hi=pc_hi, full_strength_span=pc_fspan, max_strength=pc_amax,
+            target_hue=pc_thue, full_strength_span=pc_fspan, max_strength=pc_amax,
             repair_spread=int(pc_grow), feather=pc_feather, tone_correction_radius=pc_tone,
-            tone_directionality=pc_tdir, rel_gate=bool(pc_relgate), rel_thresh=pc_relthr)
+            tone_directionality=pc_tdir, rel_thresh=pc_relthr)
         dm = 0.45 * gout
         if pcinfo["caster"].any():
             dm[pcinfo["caster"]] = 0.5 * dm[pcinfo["caster"]] + 0.5 * np.array([255., 215., 0.])
@@ -198,8 +197,7 @@ def temporal_analyze(source, clip, idx,
               minar, fspan, amax, grow, feather, gtone,
               g_area_soft, g_radius_soft, g_tdir,
               pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-              pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir,
-              pc_relgate, pc_relthr):
+              pc_chr, pc_thue, pc_relthr, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir):
     """Run the live pipeline (green -> purple cast) over the current frame + next 5; report flicker."""
     if source != "extracted clip" or clip is None or len(clip) == 0:
         return None, None, "Select an **extracted clip** in Tab 0 first.", None
@@ -225,9 +223,9 @@ def temporal_analyze(source, clip, idx,
             pout, pinfo = alg.purple_cast(
                 gout, bright_L=pc_bright, min_area=int(pc_minar), area_soft=pc_area_soft,
                 cast_radius=int(pc_radius), radius_soft=pc_radius_soft, mag_chr=pc_chr,
-                mag_lo=pc_lo, mag_hi=pc_hi, full_strength_span=pc_fspan, max_strength=pc_amax,
+                target_hue=pc_thue, full_strength_span=pc_fspan, max_strength=pc_amax,
                 repair_spread=int(pc_grow), feather=pc_feather, tone_correction_radius=pc_tone,
-                tone_directionality=pc_tdir, rel_gate=bool(pc_relgate), rel_thresh=pc_relthr)
+                tone_directionality=pc_tdir, rel_thresh=pc_relthr)
             palpha = pinfo["alpha"]
         else:
             pout, palpha = gout, np.zeros(np.asarray(gout).shape[:2], np.float32)
@@ -267,15 +265,10 @@ def export_onnx(source, clip, idx,
                 minar, fspan, amax, grow, feather, gtone,
                 g_area_soft, g_radius_soft, g_tdir,
                 pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-                pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir,
-                pc_relgate, pc_relthr,
+                pc_chr, pc_thue, pc_relthr, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir,
                 progress=gr.Progress()):
     """Export green->purple_cast to ONNX (opset 17) using the LIVE slider settings.
     A disabled pass (toggle off) is exported as a no-op via max_strength=0."""
-    if pc_relgate:
-        return ("⚠️ The experimental **Relative magenta gate** is ON but is not yet "
-                "implemented in the ONNX port — the export would silently use the absolute "
-                "hue band instead. Turn it off to export, or ask to sync it to the port first.")
     progress(0.05, desc="loading torch...")
     try:
         import torch
@@ -292,7 +285,7 @@ def export_onnx(source, clip, idx,
                  tone_directionality=g_tdir)
     purple = dict(bright_L=pc_bright, min_area=pc_minar, area_soft=pc_area_soft,
                   cast_radius=pc_radius, radius_soft=pc_radius_soft, mag_chr=pc_chr,
-                  mag_lo=pc_lo, mag_hi=pc_hi, full_strength_span=pc_fspan,
+                  target_hue=pc_thue, rel_thresh=pc_relthr, full_strength_span=pc_fspan,
                   max_strength=(pc_amax if pc_on else 0.0), repair_spread=pc_grow,
                   feather=pc_feather, tone_correction_radius=pc_tone, tone_directionality=pc_tdir)
     progress(0.3, desc="building model from current settings...")
@@ -422,20 +415,17 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 pc_area_soft = S(0, 1, PC["area_soft"], 0.05, "Area Softness", "Softens Minimum Area — fraction of it over which a marginal highlight fades in. 0 = hard cutoff.")
                 pc_radius = S(2, 60, PC["cast_radius"], 1, "Cast Reach", "Search radius in px outward from a highlight for its magenta fringe.")
                 pc_radius_soft = S(0, 1, PC["radius_soft"], 0.05, "Reach Softness", "Softens Cast Reach — fraction of it over which the fringe fades out with distance. 0 = hard cutoff.")
-                gr.Markdown("**Shadows (magenta)**")
-                pc_chr = S(0, 15, PC["mag_chr"], 0.1, "Minimum Chroma", "Min chroma (colorfulness) for a pixel to count as magenta fringe. Lower catches fainter fringe.")
-                pc_lo = S(-90, 0, PC["mag_lo"], 1, "Hue Floor", "Fringe hue band low edge — signed degrees from magenta (negative = toward blue/violet).")
-                pc_hi = S(0, 90, PC["mag_hi"], 1, "Hue Ceiling", "Fringe hue band high edge — signed degrees from magenta (positive = toward red).")
+                gr.Markdown("**Shadows (magenta)** — detected as a magenta *excess* over the scene's overall lighting tone")
+                pc_chr = S(0, 15, PC["mag_chr"], 0.1, "Minimum Chroma", "Absolute chroma floor — a pixel below this is never flagged (noise rejection), regardless of excess.")
+                pc_thue = S(-45, 45, PC["target_hue"], 1, "Target Hue", "Direction the excess is measured along, as a signed offset from magenta (315°). 0 = magenta; positive shifts toward red, negative toward violet/blue. The relative-gate analog of recentering the old hue band.")
+                pc_relthr = S(0, 20, PC["rel_thresh"], 0.5, "Excess Threshold", "Minimum magenta-excess-over-lighting-tone (CIELAB a*b* units) to flag a pixel as fringe. Higher = stricter; only pixels clearly more magenta than the scene's overall tone are corrected.")
                 gr.Markdown("**Repair**")
-                pc_fspan = S(1, 30, PC["full_strength_span"], 0.5, "Full-Strength Span", "Chroma above Minimum Chroma at which correction reaches full strength. Wider = gentler.")
+                pc_fspan = S(1, 30, PC["full_strength_span"], 0.5, "Full-Strength Span", "Excess above Excess Threshold at which correction reaches full strength. Wider = gentler.")
                 pc_amax = S(0, 1, PC["max_strength"], 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive.")
                 pc_grow = S(0, 20, PC["repair_spread"], 1, "Repair Spread", "Expand the corrected region outward by this many px before feathering.")
                 pc_feather = S(0, 5, PC["feather"], 0.1, "Feather", "Alpha feather sigma (px).")
                 pc_tone = S(5, 50, PC["tone_correction_radius"], 1, "Tone Correction Radius", "Radius (px) for estimating the local tone the magenta chroma is pulled toward (L* kept).")
                 pc_tdir = S(0, 1, PC["tone_directionality"], 0.05, "Tone Directionality", "Bias the repair-tone estimate away from the caster (blown highlight). 0 = sample tone evenly from all directions (old behavior); 1 = mostly ignore donors on the caster side, pulling repair tone from the cast (fringe) direction.")
-                gr.Markdown("**Experimental**")
-                pc_relgate = gr.Checkbox(PC["rel_gate"], label="Relative magenta gate (vs lighting tone)", info="Detect fringe as a magenta EXCESS over the scene's overall lighting tone (warm↔cool) — the luminance-weighted global mean of a*/b* — instead of the absolute [Hue Floor, Hue Ceiling] band. A warm-lit scene shifts the reference warm, so genuinely warm content collapses to it while magenta fringe (blue-shifted, opposite the warm axis) stands out. When ON, Hue Floor/Ceiling are ignored and Relative Excess drives detection. NOT yet in the ONNX export.")
-                pc_relthr = S(0, 20, PC["rel_thresh"], 0.5, "Relative Excess", "Minimum magenta-excess-over-lighting-tone (in CIELAB chroma units) to flag a pixel as fringe (relative gate only). Higher = stricter; only pixels clearly more magenta than the scene's overall tone are corrected.")
             with gr.Column(scale=2):
                 t2_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", visible=False)
                 pc_stat = gr.Textbox(label="stats", interactive=False)
@@ -478,8 +468,7 @@ with gr.Blocks(title="Defringe tuner") as demo:
            g_radius, g_minar, g_fspan, g_amax, g_grow, g_feather, g_tone,
            g_area_soft, g_radius_soft, g_tdir,
            pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-           pc_chr, pc_lo, pc_hi, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir,
-           pc_relgate, pc_relthr]
+           pc_chr, pc_thue, pc_relthr, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir]
     outs = [g_compare, g_detect, g_alpha, g_stat,
             pc_compare, pc_detect, pc_alpha, pc_stat]
 

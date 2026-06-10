@@ -93,19 +93,17 @@ class Defringe(nn.Module):
         x = F.conv2d(F.pad(x, (0, 0, r, r), mode="reflect"), k1d.transpose(2, 3))
         return x
 
-    def _pass(self, lab, P, tag, caster, shadow_ref, lo, hi, chr_floor):
+    def _pass(self, lab, P, tag, caster, shadow, strength):
+        # `shadow` (candidate mask) and `strength` (alpha ramp, pre-clamp) are computed
+        # per-detector in forward(); everything from morphology on is shared.
         L, a, b = lab[:, 0:1], lab[:, 1:2], lab[:, 2:3]
-        chroma = torch.sqrt(a * a + b * b + 1e-12)
-        hue = (torch.atan2(b, a) * (180.0 / np.pi)) % 360.0
-        ss = ((hue - shadow_ref + 180.0) % 360.0) - 180.0
-        shadow = ((chroma > chr_floor) & (ss >= lo) & (ss <= hi)).float()
         ko = 2 * getattr(self, f"open_{tag}") + 1
         co = self._dilate(self._erode(caster, ko), ko)                       # ~ Minimum Area
         R = int(P["cast_radius"])
         reach = self._sep(self._dilate(co, 2 * R + 1),                       # ~ Cast Reach
                           getattr(self, f"k_{tag}_reach"), getattr(self, f"r_{tag}_reach")).clamp(0, 1)
         keepS = shadow * reach * (1.0 - co)
-        abase = keepS * ((chroma - chr_floor) / max(P["full_strength_span"], 1e-3)).clamp(0, 1)
+        abase = keepS * strength.clamp(0, 1)
         if P["repair_spread"] > 0:
             abase = self._dilate(abase, int(2 * P["repair_spread"] + 1))
         alpha = self._sep(abase, getattr(self, f"k_{tag}_feather"),
@@ -133,13 +131,31 @@ class Defringe(nn.Module):
         hue = (torch.atan2(b, a) * (180.0 / np.pi)) % 360.0
         hs = ((hue - RED_REF + 180.0) % 360.0) - 180.0
         gcaster = ((chroma > self.g["cast_chr"]) & (hs >= self.g["band_lo"]) & (hs <= self.g["band_hi"])).float()
-        gout, gkeep = self._pass(lab, self.g, "g", gcaster, GREEN_REF,
-                                 self.g["green_lo"], self.g["green_hi"], self.g["green_chr"])
+        # green shadow: absolute teal-green hue band; strength ramps on chroma
+        gs = ((hue - GREEN_REF + 180.0) % 360.0) - 180.0
+        gshadow = ((chroma > self.g["green_chr"]) & (gs >= self.g["green_lo"]) & (gs <= self.g["green_hi"])).float()
+        gstrength = ((chroma - self.g["green_chr"]) / max(self.g["full_strength_span"], 1e-3)).clamp(0, 1)
+        gout, gkeep = self._pass(lab, self.g, "g", gcaster, gshadow, gstrength)
         gx = gkeep * gout + (1.0 - gkeep) * x                       # composite green
+
         lab2 = self.rgb2lab(gx)
-        pcaster = (lab2[:, 0:1] > self.p["bright_L"]).float()
-        pout, pkeep = self._pass(lab2, self.p, "p", pcaster, MAGENTA_REF,
-                                 self.p["mag_lo"], self.p["mag_hi"], self.p["mag_chr"])
+        L2, a2, b2 = lab2[:, 0:1], lab2[:, 1:2], lab2[:, 2:3]
+        chroma2 = torch.sqrt(a2 * a2 + b2 * b2 + 1e-12)
+        pcaster = (L2 > self.p["bright_L"]).float()
+        # purple shadow: magenta EXCESS over the scene's global lighting tone (warm<->cool),
+        # measured along target_hue; strength ramps on that excess. The reference is the
+        # luminance-weighted mean of a*/b* over lit, non-clipped pixels, reduced per-frame
+        # (keepdim over H,W) -> matches numpy's global (a_ref,b_ref).
+        th = np.radians(MAGENTA_REF + self.p["target_hue"])
+        um_a, um_b = float(np.cos(th)), float(np.sin(th))
+        wmask = L2 * (L2 < self.p["bright_L"]).float()
+        wsum = wmask.sum(dim=(2, 3), keepdim=True) + 1e-6
+        a_ref = (wmask * a2).sum(dim=(2, 3), keepdim=True) / wsum
+        b_ref = (wmask * b2).sum(dim=(2, 3), keepdim=True) / wsum
+        mexcess = (a2 - a_ref) * um_a + (b2 - b_ref) * um_b
+        pshadow = ((chroma2 > self.p["mag_chr"]) & (mexcess > self.p["rel_thresh"])).float()
+        pstrength = ((mexcess - self.p["rel_thresh"]) / max(self.p["full_strength_span"], 1e-3)).clamp(0, 1)
+        pout, pkeep = self._pass(lab2, self.p, "p", pcaster, pshadow, pstrength)
         px = pkeep * pout + (1.0 - pkeep) * gx                      # composite purple
         y = (px.clamp(0.0, 1.0) * 255.0).round()
         return y.permute(0, 2, 3, 1).to(torch.uint8)

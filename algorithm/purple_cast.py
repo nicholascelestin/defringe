@@ -22,12 +22,10 @@ MAGENTA_REF = 315.0
 
 DEFAULTS = dict(
     bright_L=88.0,      # caster: min L* for a near-white (blown highlight) source
-    mag_lo=-15.0,       # shadow hue band, signed deg from magenta (MAGENTA_REF):
-    mag_hi=50.0,        #   blue/violet edge .. magenta/red edge
     mag_chr=6.8,        # magenta chroma floor (lower = catches fainter fringe)
     cast_radius=8,      # reach from the highlight edge to search for fringe (px)
     min_area=10,        # ignore caster (highlight) blobs smaller than this (px)
-    full_strength_span=23.5,     # chroma above mag_chr at which correction is full
+    full_strength_span=10.0,     # excess above rel_thresh at which correction is full
     max_strength=0.85,           # alpha cap (opacity, NOT spatial)
     repair_spread=2,             # spatial: dilate the corrected region by this many px
     feather=2.0,                 # alpha feather sigma (px)
@@ -38,15 +36,15 @@ DEFAULTS = dict(
     # magenta chroma is pulled toward the clean down-cast side rather than back
     # toward the (fully-trusted) blown highlight. 0 = isotropic tone estimate
     # (byte-identical to before); 1 = caster-side donors fully suppressed.
-    tone_directionality=0.5,
-    # EXPERIMENTAL relative gate: detect fringe as a magenta EXCESS over the scene's
-    # overall LIGHTING TONE (warm<->cool), not an absolute hue band [mag_lo,mag_hi].
-    # The reference is the luminance-weighted global mean of a*/b*, so a warm-lit
-    # scene shifts it warm and genuinely warm content cancels while magenta fringe
-    # (blue-shifted) stands out -- fixing the scene-dependent mag_hi overshoot. Off
-    # -> byte-identical to the hue-band detector. See memory directional-repair note.
-    rel_gate=False,
-    rel_thresh=4.0,     # min magenta-excess-over-lighting-tone to flag (rel_gate only)
+    tone_directionality=0.7,
+    # Detection: a magenta EXCESS over the scene's overall LIGHTING TONE (warm<->cool),
+    # not an absolute hue band. The reference is the luminance-weighted global mean of
+    # a*/b*, so a warm-lit scene shifts it warm and genuinely warm content cancels while
+    # magenta fringe (blue-shifted) stands out -- fixing the scene-dependent overshoot
+    # the old fixed hue band suffered. See memory directional-repair note.
+    target_hue=-15.0,   # signed deg offset of the excess direction from magenta (315 deg);
+                        #   0 = magenta, + toward red, - toward violet/blue
+    rel_thresh=16.0,    # min magenta-excess-over-lighting-tone (a*b* units) to flag a pixel
 )
 
 
@@ -60,34 +58,26 @@ def purple_cast(rgb, **kw):
     src = np.asarray(rgb, np.float32)
     lab = to_lab(src)
     L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
-    hue = np.degrees(np.arctan2(b, a)) % 360.0
     chroma = np.hypot(a, b)
-    ms = ((hue - MAGENTA_REF + 180.0) % 360.0) - 180.0   # signed dist from magenta
 
     # 1. casters: near-white blown highlights (the physical axial-CA source)
     caster = L > p["bright_L"]
-    # 2. magenta-violet fringe candidates. Two gates (strength ramp matches the gate):
-    #  - absolute (default): hue in the fixed band [mag_lo,mag_hi]; ramp on chroma.
-    #  - relative (rel_gate): pixel is more magenta than its local ambient tone, i.e.
-    #    a magenta EXCESS over the surroundings -> warm ambient cancels; ramp on excess.
-    if p["rel_gate"]:
-        um_a, um_b = np.cos(np.radians(MAGENTA_REF)), np.sin(np.radians(MAGENTA_REF))
-        # reference = the scene's overall lighting tone (warm<->cool cast): the
-        # luminance-weighted mean of a*/b* over lit, non-clipped pixels, so brightly
-        # lit surfaces set it and blown highlights (achromatic) are excluded. One
-        # global (a_ref,b_ref) per frame -> temporally stable, unlike a local blur.
-        # Magenta fringe is blue-shifted (-b*) while warm content is yellow (+b*), so
-        # subtracting a warm cast makes fringe stand out and warm content collapse.
-        w = L * (L < p["bright_L"])
-        wsum = float(w.sum()) + 1e-6
-        a_ref = float((w * a).sum() / wsum)
-        b_ref = float((w * b).sum() / wsum)
-        mexcess = (a - a_ref) * um_a + (b - b_ref) * um_b    # magenta excess over the lighting tone
-        mag = (chroma > p["mag_chr"]) & (mexcess > p["rel_thresh"])
-        strength = np.clip((mexcess - p["rel_thresh"]) / max(p["full_strength_span"], 1e-3), 0, 1)
-    else:
-        mag = (chroma > p["mag_chr"]) & (ms >= p["mag_lo"]) & (ms <= p["mag_hi"])
-        strength = np.clip((chroma - p["mag_chr"]) / max(p["full_strength_span"], 1e-3), 0, 1)
+    # 2. magenta fringe candidates: a magenta EXCESS over the scene's overall lighting
+    #    tone, measured along the Target Hue direction. The reference is the
+    #    luminance-weighted mean of a*/b* over lit, non-clipped pixels, so brightly lit
+    #    surfaces set it and blown highlights (achromatic) are excluded. One global
+    #    (a_ref,b_ref) per frame -> temporally stable, unlike a local blur. Magenta fringe
+    #    is blue-shifted (-b*) while warm content is yellow (+b*), so subtracting a warm
+    #    cast makes fringe stand out and warm content collapse. Strength ramps on the excess.
+    th = np.radians(MAGENTA_REF + p["target_hue"])
+    um_a, um_b = np.cos(th), np.sin(th)                  # excess direction (0 -> magenta)
+    w = L * (L < p["bright_L"])
+    wsum = float(w.sum()) + 1e-6
+    a_ref = float((w * a).sum() / wsum)
+    b_ref = float((w * b).sum() / wsum)
+    mexcess = (a - a_ref) * um_a + (b - b_ref) * um_b    # magenta excess over the lighting tone
+    mag = (chroma > p["mag_chr"]) & (mexcess > p["rel_thresh"])
+    strength = np.clip((mexcess - p["rel_thresh"]) / max(p["full_strength_span"], 1e-3), 0, 1)
 
     keepS = np.zeros_like(chroma, np.float32)
     caster_big = np.zeros_like(chroma, bool)
