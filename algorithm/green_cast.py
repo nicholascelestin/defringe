@@ -42,8 +42,8 @@ DEFAULTS = dict(
     # trade a little selectivity for temporal stability / less flicker). Baked to
     # a conservative "light" level: ~18% less static flicker, ~20% less alpha
     # jitter on frames 235-246, with only a small coverage increase.
-    area_soft=0.3,      # min_area ramp (fraction of min_area)
-    radius_soft=0.2,    # cast_radius distance falloff (fraction of cast_radius)
+    area_soft=0.4,      # min_area ramp (fraction of min_area)
+    radius_soft=0.4,    # cast_radius distance falloff (fraction of cast_radius)
 )
 
 

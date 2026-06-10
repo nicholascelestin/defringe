@@ -15,13 +15,19 @@ dependencies = [
     "matplotlib==3.10.9",
 ]
 
+[project.optional-dependencies]
+export = [
+    "onnx>=1.21.0",
+    "onnxruntime>=1.26.0",
+    "onnxscript>=0.7.0",
+    "torch>=2.12.0",
+]
+
 # System dependency (not pip): ffmpeg / ffprobe must be on PATH — video_io.py
 # shells out to them for decode/encode.
 #
-# The delivery/ ONNX export path additionally imports torch, onnx and
-# onnxruntime. These are NOT installed in the current working venv, so they are
-# intentionally left out of the lock. To add them as an optional extra later:
-#     uv add --optional export torch onnx onnxruntime
+# The `export` extra (torch/onnx/onnxruntime) is only needed to build/run the
+# ONNX port of the pipeline:  uv sync --extra export
 
 [tool.uv]
 # This is an application with a flat module layout (algorithm/, app.py,
