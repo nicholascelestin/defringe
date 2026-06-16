@@ -320,9 +320,14 @@ def run_onnx_clip(source, clip, progress=gr.Progress()):
     frames = np.concatenate(outs, 0)
     h, w = frames.shape[1:3]
     proc = subprocess.Popen(
+        # Control the RGB->YUV matrix and TAG the output BT.709, else the browser
+        # assumes 709 over swscale's 601 default -> the preview colour-shifts vs the
+        # gallery stills. (Same fix as the Colab notebook's COLOR_MODE="bt709".)
         ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-         "-s", f"{w}x{h}", "-r", f"{VFPS:.0f}", "-i", "-", "-an", "-c:v", "libx264",
-         "-crf", "16", "-preset", "fast", "-pix_fmt", "yuv420p", ONNX_PREVIEW],
+         "-s", f"{w}x{h}", "-r", f"{VFPS:.0f}", "-color_range", "pc", "-i", "-", "-an",
+         "-vf", "scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p,"
+                "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+         "-c:v", "libx264", "-crf", "16", "-preset", "fast", "-pix_fmt", "yuv420p", ONNX_PREVIEW],
         stdin=subprocess.PIPE)
     proc.stdin.write(np.ascontiguousarray(frames, np.uint8).tobytes())
     proc.stdin.close(); proc.wait()
@@ -356,47 +361,55 @@ TOOLTIP_JS = """
 """
 
 with gr.Blocks(title="Defringe tuner") as demo:
-    gr.Markdown("# Defringe tuner\nLogic in `algorithm/`. Chain: **Tab 1 green → Tab 2 purple**, "
-                "each toggleable. Frame chosen in **Tab 0**.")
+    gr.Markdown("# Defringe tuner\n"
+                "Remove green & purple colour fringing from stills and video — only chroma is "
+                "touched, lightness stays put.\n\n"
+                "**Flow:** pick a frame in **Source** → tune **Green**, then **Purple** "
+                "(each toggleable) → check **Temporal** for flicker → **ONNX export** to ship. "
+                "Hover any control for what it does.")
     clip_state = gr.State(None)
 
     with gr.Tab("0 · Source"):
+        gr.Markdown("Choose the frame to tune on — a still, or a clip pulled from the video. "
+                    "This selection feeds the Green and Purple tabs.")
         with gr.Row():
             with gr.Column(scale=1):
-                t0_source = gr.Radio(["extracted clip", *STILLS], value="inside", label="current source")
+                t0_source = gr.Radio(["extracted clip", *STILLS], value="inside", label="current source", info="Which image feeds tabs 1–2: a still, or the clip extracted below.")
                 gr.Markdown(f"**Video** (full file {VDUR:.0f}s)")
-                t0_start = gr.Slider(0, max(1, VDUR - CLIP_SECS), value=0, step=1, label=f"seek (s) — extracts {CLIP_SECS}s")
-                t0_full = gr.Checkbox(False, label="full-res clip (~1.5 GB; off = 720px)")
+                t0_start = gr.Slider(0, max(1, VDUR - CLIP_SECS), value=0, step=1, label=f"seek (s) — extracts {CLIP_SECS}s", info="Where in the full video to grab the clip from.")
+                t0_full = gr.Checkbox(False, label="full-res clip (~1.5 GB; off = 720px)", info="On = full-res (slow, ~1.5 GB); off = 720px for snappy tuning.")
                 t0_extract = gr.Button("Extract 10s clip → memory", variant="primary")
                 t0_info = gr.Textbox(label="clip info", interactive=False)
-                t0_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)")
+                t0_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", info="Which clip frame to preview and tune on.")
             with gr.Column(scale=2):
                 t0_seek = gr.Image(label="seek-point preview (full video) — where the clip starts", height=300)
                 t0_preview = gr.Image(label="current frame (feeds tabs 1 & 2)", height=300)
 
-    with gr.Tab("1 · Green cast"):
+    with gr.Tab("1 · Green defringe"):
+        gr.Markdown("Removes green fringe cast by saturated warm (red/purple) sources — "
+                    "the first pass in the chain.")
         with gr.Row():
             with gr.Column(scale=1):
-                g_on = gr.Checkbox(True, label="green pass ENABLED", info="Toggle the whole green-cast pass; off = passthrough to tab 2.")
+                g_on = gr.Checkbox(True, label="green pass ENABLED", info="Turn the green pass on/off (off = passes straight to the purple tab).")
                 gr.Markdown("**Casters (warm)**")
-                g_cast_chr = S(0, 30, G["cast_chr"], 0.5, "Minimum Chroma", "Minimum chroma (colorfulness) for a warm red/purple source to count as a caster. Lower = more casters.")
-                g_band_lo = S(-90, 0, G["band_lo"], 1, "Hue Floor", "Caster hue band low edge — signed degrees from red (negative = toward purple).")
-                g_band_hi = S(0, 90, G["band_hi"], 1, "Hue Ceiling", "Caster hue band high edge — signed degrees from red (positive = toward orange).")
-                g_minar = S(0, 300, G["min_area"], 1, "Minimum Area", "Ignore caster blobs smaller than this many px (noise rejection).")
-                g_area_soft = S(0, 1, G["area_soft"], 0.05, "Area Softness", "Softens Minimum Area — fraction of it over which a marginal-size caster fades in instead of popping. 0 = hard cutoff.")
-                g_radius = S(2, 60, G["cast_radius"], 1, "Cast Reach", "How far a caster casts: search radius in px outward from a caster for its green shadow.")
-                g_radius_soft = S(0, 1, G["radius_soft"], 0.05, "Reach Softness", "Softens Cast Reach — fraction of it over which the shadow fades out with distance instead of a hard edge. 0 = hard cutoff.")
+                g_cast_chr = S(0, 30, G["cast_chr"], 0.5, "Minimum Chroma", "How saturated a warm source must be to count as a fringe-caster. Lower = more casters.")
+                g_band_lo = S(-90, 0, G["band_lo"], 1, "Hue Floor", "Low edge of the caster hue range; lower reaches toward purple.")
+                g_band_hi = S(0, 90, G["band_hi"], 1, "Hue Ceiling", "High edge of the caster hue range; higher reaches toward orange.")
+                g_minar = S(0, 300, G["min_area"], 1, "Minimum Area", "Ignore caster blobs smaller than this (px) to reject noise.")
+                g_area_soft = S(0, 1, G["area_soft"], 0.05, "Area Softness", "Fade marginal-size casters in/out instead of popping — for temporal stability. 0 = hard cutoff.")
+                g_radius = S(2, 60, G["cast_radius"], 1, "Cast Reach", "How far from a caster (px) to look for its green fringe.")
+                g_radius_soft = S(0, 1, G["radius_soft"], 0.05, "Reach Softness", "Fade the fringe out with distance instead of a hard edge — for temporal stability. 0 = hard cutoff.")
                 gr.Markdown("**Shadows (cool)**")
-                g_gchr = S(0, 15, G["green_chr"], 0.1, "Minimum Chroma", "Minimum chroma (colorfulness) for a pixel to count as a valley-green shadow. Lower catches fainter shadows.")
-                g_glo = S(-140, 0, G["green_lo"], 1, "Hue Floor", "Shadow hue band low edge — signed degrees from teal-green (negative = toward green/yellow).")
-                g_ghi = S(0, 140, G["green_hi"], 1, "Hue Ceiling", "Shadow hue band high edge — signed degrees from teal-green (positive = toward blue/violet).")
+                g_gchr = S(0, 15, G["green_chr"], 0.1, "Minimum Chroma", "How saturated a pixel must be to count as green fringe. Lower = catch fainter fringe.")
+                g_glo = S(-140, 0, G["green_lo"], 1, "Hue Floor", "Low edge of the green-fringe hue range; lower reaches toward green/yellow.")
+                g_ghi = S(0, 140, G["green_hi"], 1, "Hue Ceiling", "High edge of the green-fringe hue range; higher reaches toward blue/violet.")
                 gr.Markdown("**Repair**")
-                g_fspan = S(1, 30, G["full_strength_span"], 0.5, "Full-Strength Span", "Chroma above Minimum Chroma at which green correction reaches full strength. Wider = gentler (only vivid green fully corrected); narrower = more aggressive.")
-                g_amax = S(0, 1, G["max_strength"], 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive (this is opacity, not spatial size).")
-                g_grow = S(0, 20, G["repair_spread"], 1, "Repair Spread", "Expand the corrected region outward by this many px before feathering.")
-                g_feather = S(0, 5, G["feather"], 0.1, "Feather", "Alpha feather sigma (px). Softens the edge and slightly spreads it.")
-                g_tone = S(5, 50, G["tone_correction_radius"], 1, "Tone Correction Radius", "Radius (px) for estimating the local tone that green chroma is pulled toward (L* kept).")
-                g_tdir = S(0, 1, G["tone_directionality"], 0.05, "Tone Directionality", "Bias the repair-tone estimate away from the caster. 0 = sample tone evenly from all directions (old behavior); 1 = mostly ignore donors on the caster side, pulling repair tone from the cast (down-shadow) direction.")
+                g_fspan = S(1, 30, G["full_strength_span"], 0.5, "Full-Strength Span", "Extra chroma above Minimum Chroma that reaches full correction. Wider = gentler.")
+                g_amax = S(0, 1, G["max_strength"], 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive.")
+                g_grow = S(0, 20, G["repair_spread"], 1, "Repair Spread", "Grow the corrected region outward by this many px before feathering.")
+                g_feather = S(0, 5, G["feather"], 0.1, "Feather", "Soften/blur the correction's edge (px).")
+                g_tone = S(5, 50, G["tone_correction_radius"], 1, "Tone Correction Radius", "How far out (px) to sample the clean colour fringe is pulled toward.")
+                g_tdir = S(0, 1, G["tone_directionality"], 0.05, "Tone Directionality", "Pull repair colour from the cast side, not the caster. 0 = all directions, 1 = away from caster.")
             with gr.Column(scale=2):
                 t1_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", visible=False)
                 g_stat = gr.Textbox(label="stats", interactive=False)
@@ -406,26 +419,28 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 g_alpha = gr.Image(label="alpha", height=230)
 
     with gr.Tab("2 · Purple defringe"):
+        gr.Markdown("Removes magenta/violet fringe cast by blown highlights — "
+                    "runs on top of the green pass's output.")
         with gr.Row():
             with gr.Column(scale=1):
-                pc_on = gr.Checkbox(True, label="purple pass ENABLED", info="Purple defringe (casting-shadow model: bright highlight = caster, magenta = shadow) applied to tab 1's green output.")
+                pc_on = gr.Checkbox(True, label="purple pass ENABLED", info="Turn the purple pass on/off (runs after the green pass).")
                 gr.Markdown("**Casters (bright)**")
-                pc_bright = S(50, 100, PC["bright_L"], 1, "Minimum Lightness", "Min L* for a near-white blown highlight to count as a caster (the physical axial-CA source).")
-                pc_minar = S(0, 300, PC["min_area"], 1, "Minimum Area", "Ignore highlight blobs smaller than this many px.")
-                pc_area_soft = S(0, 1, PC["area_soft"], 0.05, "Area Softness", "Softens Minimum Area — fraction of it over which a marginal highlight fades in. 0 = hard cutoff.")
-                pc_radius = S(2, 60, PC["cast_radius"], 1, "Cast Reach", "Search radius in px outward from a highlight for its magenta fringe.")
-                pc_radius_soft = S(0, 1, PC["radius_soft"], 0.05, "Reach Softness", "Softens Cast Reach — fraction of it over which the fringe fades out with distance. 0 = hard cutoff.")
+                pc_bright = S(50, 100, PC["bright_L"], 1, "Minimum Lightness", "How bright a highlight must be to count as a fringe-caster.")
+                pc_minar = S(0, 300, PC["min_area"], 1, "Minimum Area", "Ignore highlight blobs smaller than this (px).")
+                pc_area_soft = S(0, 1, PC["area_soft"], 0.05, "Area Softness", "Fade marginal highlights in/out instead of popping — for temporal stability. 0 = hard cutoff.")
+                pc_radius = S(2, 60, PC["cast_radius"], 1, "Cast Reach", "How far from a highlight (px) to look for its magenta fringe.")
+                pc_radius_soft = S(0, 1, PC["radius_soft"], 0.05, "Reach Softness", "Fade the fringe out with distance instead of a hard edge — for temporal stability. 0 = hard cutoff.")
                 gr.Markdown("**Shadows (magenta)** — detected as a magenta *excess* over the scene's overall lighting tone")
-                pc_chr = S(0, 15, PC["mag_chr"], 0.1, "Minimum Chroma", "Absolute chroma floor — a pixel below this is never flagged (noise rejection), regardless of excess.")
-                pc_thue = S(-45, 45, PC["target_hue"], 1, "Target Hue", "Direction the excess is measured along, as a signed offset from magenta (315°). 0 = magenta; positive shifts toward red, negative toward violet/blue. The relative-gate analog of recentering the old hue band.")
-                pc_relthr = S(0, 20, PC["rel_thresh"], 0.5, "Excess Threshold", "Minimum magenta-excess-over-lighting-tone (CIELAB a*b* units) to flag a pixel as fringe. Higher = stricter; only pixels clearly more magenta than the scene's overall tone are corrected.")
+                pc_chr = S(0, 15, PC["mag_chr"], 0.1, "Minimum Chroma", "Chroma floor — pixels below this are never flagged (noise rejection).")
+                pc_thue = S(-45, 45, PC["target_hue"], 1, "Target Hue", "Shift the detected fringe colour: 0 = magenta, higher = toward red, lower = toward violet/blue.")
+                pc_relthr = S(0, 20, PC["rel_thresh"], 0.5, "Excess Threshold", "How much more magenta than the scene's overall tone a pixel must be to count as fringe. Higher = stricter.")
                 gr.Markdown("**Repair**")
-                pc_fspan = S(1, 30, PC["full_strength_span"], 0.5, "Full-Strength Span", "Excess above Excess Threshold at which correction reaches full strength. Wider = gentler.")
+                pc_fspan = S(1, 30, PC["full_strength_span"], 0.5, "Full-Strength Span", "Extra excess above the threshold that reaches full correction. Wider = gentler.")
                 pc_amax = S(0, 1, PC["max_strength"], 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive.")
-                pc_grow = S(0, 20, PC["repair_spread"], 1, "Repair Spread", "Expand the corrected region outward by this many px before feathering.")
-                pc_feather = S(0, 5, PC["feather"], 0.1, "Feather", "Alpha feather sigma (px).")
-                pc_tone = S(5, 50, PC["tone_correction_radius"], 1, "Tone Correction Radius", "Radius (px) for estimating the local tone the magenta chroma is pulled toward (L* kept).")
-                pc_tdir = S(0, 1, PC["tone_directionality"], 0.05, "Tone Directionality", "Bias the repair-tone estimate away from the caster (blown highlight). 0 = sample tone evenly from all directions (old behavior); 1 = mostly ignore donors on the caster side, pulling repair tone from the cast (fringe) direction.")
+                pc_grow = S(0, 20, PC["repair_spread"], 1, "Repair Spread", "Grow the corrected region outward by this many px before feathering.")
+                pc_feather = S(0, 5, PC["feather"], 0.1, "Feather", "Soften/blur the correction's edge (px).")
+                pc_tone = S(5, 50, PC["tone_correction_radius"], 1, "Tone Correction Radius", "How far out (px) to sample the clean colour fringe is pulled toward.")
+                pc_tdir = S(0, 1, PC["tone_directionality"], 0.05, "Tone Directionality", "Pull repair colour from the fringe side, not the highlight. 0 = all directions, 1 = away from highlight.")
             with gr.Column(scale=2):
                 t2_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", visible=False)
                 pc_stat = gr.Textbox(label="stats", interactive=False)
@@ -434,10 +449,9 @@ with gr.Blocks(title="Defringe tuner") as demo:
                                         columns=2, object_fit="contain", preview=False)
                 pc_alpha = gr.Image(label="purple alpha", height=230)
 
-    with gr.Tab("3 · Temporal"):
-        gr.Markdown("Flicker analysis on the **current frame + next 5** of the in-memory clip, "
-                    "run through the **live Tab 1/2 settings**. Enabled once an *extracted clip* "
-                    "is the source — no canonical temporal algorithm yet, this just measures.")
+    with gr.Tab("3 · Temporal Analysis"):
+        gr.Markdown("Measures how much the correction flickers frame-to-frame under your current "
+                    "settings. Extract a clip, then **Analyze** to spot instability before exporting.")
         with gr.Row():
             with gr.Column(scale=1):
                 t3_frame = gr.Slider(0, 249, value=0, step=1, label="start frame (within clip)", visible=False)
@@ -450,10 +464,9 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 temporal_plot = gr.Image(label="flicker per frame-pair", height=260)
 
     with gr.Tab("ONNX export"):
-        gr.Markdown("Export the **green → purple** pipeline to a portable ONNX graph using "
-                    "your **current slider settings** (tabs 1 & 2), then run it over the extracted "
-                    "clip. The ONNX is an ~0.1 mean-ΔRGB approximation of the exact numpy passes; "
-                    "needs the `export` extra (`uv sync --extra export`).")
+        gr.Markdown("Bake your current settings into a portable ONNX model, then run it over the "
+                    "clip to preview. A close approximation of the exact passes; needs the "
+                    "`export` extra (`uv sync --extra export`).")
         with gr.Row():
             with gr.Column(scale=1):
                 onnx_export_btn = gr.Button("① Export ONNX (current settings)", variant="primary")
