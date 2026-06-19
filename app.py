@@ -25,7 +25,6 @@ import matplotlib.pyplot as plt
 import video_io
 import defringe_algorithm as alg
 
-PREVIEW_W = 720          # downscale width for in-memory clips (full-res 1080p ~1.5 GB)
 DEFAULT_SECS = 10        # clip length to grab into memory, in seconds
 ONNX_PATH = "cast_defringe.onnx"            # exported model (green->purple cast)
 ONNX_PREVIEW = "onnx_preview.mp4"           # last ONNX-on-clip render (gitignored)
@@ -157,22 +156,22 @@ def run_chain(still, clip, idx, g_on, pc_on, *vals):
 
 def on_upload(path):
     """Route an upload: an image becomes the tuning frame; a video reveals the seek /
-    seconds / full-res / extract controls. Returns updates across the Source tab."""
+    seconds / extract controls. Returns updates across the Source tab."""
     hide, off = gr.update(visible=False), gr.update(interactive=False)
     if not path:                                          # cleared
         return (None, None, None, "", None, None,
-                hide, hide, hide, hide, hide, hide, hide, off, off)
+                hide, hide, hide, hide, hide, hide, off, off)
     if video_io.is_video(path):
         w, h, nb, fps = video_io.probe(path)
         dur = nb / fps if fps else 0
         info = f"video {w}x{h} {fps:.0f}fps {dur:.0f}s — set seconds & seek, then Extract"
         return (None, None, path, info, video_io.read_frame(path, 0.0, max_w=960), None,
                 gr.update(visible=True, maximum=max(0, dur), value=0),       # seek
-                gr.update(visible=True), gr.update(visible=True), gr.update(visible=True),  # secs/full/extract
+                gr.update(visible=True), gr.update(visible=True),            # secs/extract
                 hide, hide, hide, off, off)               # clip scrubbers + clip-only buttons (need a clip)
     img = video_io.read_image(path)
     return (img, None, None, f"image {img.shape[1]}x{img.shape[0]}", None, img,
-            hide, hide, hide, hide, hide, hide, hide, off, off)
+            hide, hide, hide, hide, hide, hide, off, off)
 
 
 def seek_preview(video_path, start_sec):
@@ -182,18 +181,16 @@ def seek_preview(video_path, start_sec):
     return video_io.read_frame(video_path, float(start_sec), max_w=960)
 
 
-def extract_clip(video_path, start_sec, secs, full_res):
-    """Decode `secs` seconds from `video_path` into memory; the clip becomes the active
-    source (clears any uploaded still)."""
+def extract_clip(video_path, start_sec, secs):
+    """Decode `secs` seconds from `video_path` into memory at full res; the clip becomes
+    the active source (clears any uploaded still)."""
     if not video_path:
         return (None, None, "Upload a video first.", None, gr.update(), gr.update(),
                 gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=False), 25.0)
-    max_w = None if full_res else PREVIEW_W
-    frames, fps = video_io.read_clip(video_path, float(start_sec), float(secs), max_w=max_w)
+    frames, fps = video_io.read_clip(video_path, float(start_sec), float(secs))
     n = len(frames)
     info = (f"{n} frames @ {fps:.0f}fps from {start_sec:.0f}s "
-            f"({frames.shape[2]}x{frames.shape[1]}, ~{frames.nbytes/1e6:.0f} MB"
-            f"{' · FULL RES' if full_res else ''})")
+            f"({frames.shape[2]}x{frames.shape[1]}, ~{frames.nbytes/1e6:.0f} MB)")
     scrub = gr.update(maximum=max(0, n - 1), value=0, visible=True)
     return (None, frames, info, frames[0], gr.update(maximum=max(0, n - 1), value=0),
             scrub, scrub, scrub, gr.update(interactive=True), gr.update(interactive=True), fps)
@@ -442,8 +439,7 @@ with gr.Blocks(title="Defringe tuner") as demo:
             with gr.Column(scale=1):
                 t0_upload = gr.File(file_types=["image", "video"], type="filepath", label="source — image or video")
                 t0_seek = gr.Slider(0, 1, value=0, step=1, label="seek (s)", visible=False, info="Where in the video to start the clip.")
-                t0_secs = gr.Slider(1, 30, value=DEFAULT_SECS, step=1, label="seconds to grab into memory", visible=False, info="Clip length decoded into RAM (longer = more memory).")
-                t0_full = gr.Checkbox(False, label="full-res clip (~1.5 GB; off = 720px)", visible=False, info="On = full-res (slow, big); off = 720px for snappy tuning.")
+                t0_secs = gr.Slider(1, 30, value=DEFAULT_SECS, step=1, label="seconds to grab into memory", visible=False, info="Full-res clip length decoded into RAM (longer = more memory).")
                 t0_extract = gr.Button("Extract clip → memory", variant="primary", visible=False)
                 t0_info = gr.Textbox(label="info", interactive=False)
                 t0_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", info="Which clip frame to preview and tune on.")
@@ -554,11 +550,11 @@ with gr.Blocks(title="Defringe tuner") as demo:
         (c.release if isinstance(c, gr.Slider) else c.change)(run_chain, ins, outs)
 
     upload_outs = [still_state, clip_state, video_state, t0_info, t0_seekimg, t0_preview,
-                   t0_seek, t0_secs, t0_full, t0_extract, t1_frame, t2_frame, t3_frame,
+                   t0_seek, t0_secs, t0_extract, t1_frame, t2_frame, t3_frame,
                    temporal_btn, onnx_run_btn]
     t0_upload.change(on_upload, [t0_upload], upload_outs).then(run_chain, ins, outs)
     t0_seek.release(seek_preview, [video_state, t0_seek], [t0_seekimg])
-    t0_extract.click(extract_clip, [video_state, t0_seek, t0_secs, t0_full],
+    t0_extract.click(extract_clip, [video_state, t0_seek, t0_secs],
                      [still_state, clip_state, t0_info, t0_preview, t0_frame,
                       t1_frame, t2_frame, t3_frame, temporal_btn, onnx_run_btn, fps_state]) \
               .then(run_chain, ins, outs)

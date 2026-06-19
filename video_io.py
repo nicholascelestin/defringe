@@ -39,27 +39,19 @@ def read_image(path: str) -> np.ndarray:
     return np.asarray(Image.open(path).convert("RGB"))
 
 
-def read_clip(path: str, start_sec: float, dur_sec: float,
-              max_w: Optional[int] = None) -> Tuple[np.ndarray, float]:
-    """Seek to `start_sec` and decode a `dur_sec` clip into memory as RGB.
+def read_clip(path: str, start_sec: float, dur_sec: float) -> Tuple[np.ndarray, float]:
+    """Seek to `start_sec` and decode a `dur_sec` clip into memory as full-res RGB.
 
     Returns (frames[N,H,W,3] uint8, fps). `-ss` before `-i` makes the seek fast
-    (keyframe-accurate). Pass max_w to downscale (a full-res 10s/1080p clip is
-    ~1.5 GB; downscaling keeps RAM and scrubbing snappy).
+    (keyframe-accurate).
     """
     w, h, _, fps = probe(path)
-    ow, oh = w, h
-    vf = []
-    if max_w and w > max_w:
-        ow = max_w
-        oh = int(round(h * max_w / w / 2)) * 2     # keep even dims
-        vf = ["-vf", f"scale={ow}:{oh}"]
     raw = subprocess.run(
         ["ffmpeg", "-v", "error", "-ss", f"{start_sec}", "-t", f"{dur_sec}",
-         "-i", path, *vf, "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+         "-i", path, "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
         capture_output=True, check=True).stdout
-    n = len(raw) // (ow * oh * 3)
-    frames = np.frombuffer(raw[: n * ow * oh * 3], np.uint8).reshape(n, oh, ow, 3)
+    n = len(raw) // (w * h * 3)
+    frames = np.frombuffer(raw[: n * w * h * 3], np.uint8).reshape(n, h, w, 3)
     return frames, fps
 
 
