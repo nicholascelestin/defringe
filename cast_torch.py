@@ -1,7 +1,7 @@
 """Torch/ONNX port of the canonical green_cast -> purple_cast pipeline.
 
 Option A: a SEPARATE, ONNX-able approximation of the numpy algorithm in
-`algorithm/` (which is left untouched). Two ops have no ONNX equivalent and are
+`defringe_algorithm.py` (which is left untouched). Two ops have no ONNX equivalent and are
 approximated; the per-caster area weighting is dropped:
 
   scipy.ndimage.label (Minimum Area)        -> morphological opening (erode/dilate)
@@ -19,9 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from algorithm import GREEN_CAST, PURPLE_CAST
-from algorithm.green_cast import RED_REF, GREEN_REF
-from algorithm.purple_cast import MAGENTA_REF
+from defringe_algorithm import GREEN_CAST, PURPLE_CAST, RED_REF, GREEN_REF, MAGENTA_REF
 
 # skimage-matching colour constants (sRGB, D65/2deg)
 _XYZ_FROM_RGB = np.array([[0.412453, 0.357580, 0.180423],
@@ -33,6 +31,8 @@ _LAB_EPS, _LAB_KAPPA, _LAB_OFF = 0.008856, 7.787, 16.0 / 116.0
 
 
 def _gauss1d(sigma, truncate=4.0):
+    if sigma <= 0:                                  # no blur (cf. numpy feather=0):
+        return torch.ones(1, 1, 1, 1), 0           # 1-tap identity kernel, radius 0
     r = max(1, int(truncate * sigma + 0.5))
     xs = torch.arange(-r, r + 1, dtype=torch.float32)
     k = torch.exp(-(xs ** 2) / (2.0 * sigma * sigma))
@@ -52,11 +52,16 @@ class Defringe(nn.Module):
         for tag, P in (("g", self.g), ("p", self.p)):
             for nm, sig in (("feather", P["feather"]),
                             ("tone", P["tone_correction_radius"]),
-                            ("reach", max(P["radius_soft"] * P["cast_radius"], 1e-3))):
+                            ("reach", max(P["radius_softness"] * P["cast_radius"], 1e-3))):
                 k, r = _gauss1d(sig)
                 self.register_buffer(f"k_{tag}_{nm}", k)
                 setattr(self, f"r_{tag}_{nm}", r)
-            setattr(self, f"open_{tag}", max(1, int(round((P["min_area"] / np.pi) ** 0.5))))
+            # Box-sum window for the area test (must hold ~min_area px). We test a
+            # local bright-pixel COUNT, matching numpy's connected-component AREA
+            # threshold, instead of a morphological opening — an opening needs a
+            # solid k×k square to survive and so erased thin highlight rims, the
+            # dominant casters for axial-CA purple fringe (heavy under-correction).
+            setattr(self, f"areaw_{tag}", 2 * max(1, int(round(P["min_area"] ** 0.5))) + 1)
 
     # ---- colour ----
     def _mm(self, x, m):
@@ -97,8 +102,16 @@ class Defringe(nn.Module):
         # `shadow` (candidate mask) and `strength` (alpha ramp, pre-clamp) are computed
         # per-detector in forward(); everything from morphology on is shared.
         L, a, b = lab[:, 0:1], lab[:, 1:2], lab[:, 2:3]
-        ko = 2 * getattr(self, f"open_{tag}") + 1
-        co = self._dilate(self._erode(caster, ko), ko)                       # ~ Minimum Area
+        # Minimum Area as a local bright-pixel COUNT (box-sum via avg_pool), softened
+        # near the threshold for temporal stability (cf. numpy soft_step on blob area).
+        w = getattr(self, f"areaw_{tag}")
+        dens = F.avg_pool2d(caster, w, stride=1, padding=w // 2) * float(w * w)
+        ma, aw = float(P["min_area"]), float(P["area_softness"]) * float(P["min_area"])
+        if aw > 0:
+            t = ((dens - ma) / (2.0 * aw) + 0.5).clamp(0, 1)
+            co = caster * (t * t * (3.0 - 2.0 * t))                          # ~ Minimum Area
+        else:
+            co = caster * (dens >= ma).float()
         R = int(P["cast_radius"])
         reach = self._sep(self._dilate(co, 2 * R + 1),                       # ~ Cast Reach
                           getattr(self, f"k_{tag}_reach"), getattr(self, f"r_{tag}_reach")).clamp(0, 1)
@@ -107,7 +120,7 @@ class Defringe(nn.Module):
         if P["repair_spread"] > 0:
             abase = self._dilate(abase, int(2 * P["repair_spread"] + 1))
         alpha = self._sep(abase, getattr(self, f"k_{tag}_feather"),
-                          getattr(self, f"r_{tag}_feather")).clamp(0, P["max_strength"])
+                          getattr(self, f"r_{tag}_feather")).clamp(0, P["max_opacity"])
         # directional repair (cf. numpy `donor`): down-weight tone donors on the
         # caster side. `reach` approximates caster-nearness (~1 over the caster and
         # its reach, ~0 on the clean down-cast side), so multiplying it out of the
@@ -130,31 +143,42 @@ class Defringe(nn.Module):
         chroma = torch.sqrt(a * a + b * b + 1e-12)
         hue = (torch.atan2(b, a) * (180.0 / np.pi)) % 360.0
         hs = ((hue - RED_REF + 180.0) % 360.0) - 180.0
-        gcaster = ((chroma > self.g["cast_chr"]) & (hs >= self.g["band_lo"]) & (hs <= self.g["band_hi"])).float()
+        gcaster = ((chroma > self.g["caster_min_chroma"]) & (hs >= self.g["caster_hue_lo"]) & (hs <= self.g["caster_hue_hi"])).float()
         # green shadow: absolute teal-green hue band; strength ramps on chroma
         gs = ((hue - GREEN_REF + 180.0) % 360.0) - 180.0
-        gshadow = ((chroma > self.g["green_chr"]) & (gs >= self.g["green_lo"]) & (gs <= self.g["green_hi"])).float()
-        gstrength = ((chroma - self.g["green_chr"]) / max(self.g["full_strength_span"], 1e-3)).clamp(0, 1)
+        gshadow = ((chroma > self.g["fringe_min_chroma"]) & (gs >= self.g["fringe_hue_lo"]) & (gs <= self.g["fringe_hue_hi"])).float()
+        gstrength = ((chroma - self.g["fringe_min_chroma"]) / max(self.g["full_strength_span"], 1e-3)).clamp(0, 1)
         gout, gkeep = self._pass(lab, self.g, "g", gcaster, gshadow, gstrength)
         gx = gkeep * gout + (1.0 - gkeep) * x                       # composite green
 
         lab2 = self.rgb2lab(gx)
         L2, a2, b2 = lab2[:, 0:1], lab2[:, 1:2], lab2[:, 2:3]
         chroma2 = torch.sqrt(a2 * a2 + b2 * b2 + 1e-12)
-        pcaster = (L2 > self.p["bright_L"]).float()
+        pcaster = (L2 > self.p["caster_min_lightness"]).float()
         # purple shadow: magenta EXCESS over the scene's global lighting tone (warm<->cool),
         # measured along target_hue; strength ramps on that excess. The reference is the
         # luminance-weighted mean of a*/b* over lit, non-clipped pixels, reduced per-frame
         # (keepdim over H,W) -> matches numpy's global (a_ref,b_ref).
         th = np.radians(MAGENTA_REF + self.p["target_hue"])
         um_a, um_b = float(np.cos(th)), float(np.sin(th))
-        wmask = L2 * (L2 < self.p["bright_L"]).float()
+        wmask = L2 * (L2 < self.p["caster_min_lightness"]).float()
         wsum = wmask.sum(dim=(2, 3), keepdim=True) + 1e-6
         a_ref = (wmask * a2).sum(dim=(2, 3), keepdim=True) / wsum
         b_ref = (wmask * b2).sum(dim=(2, 3), keepdim=True) / wsum
-        mexcess = (a2 - a_ref) * um_a + (b2 - b_ref) * um_b
-        pshadow = ((chroma2 > self.p["mag_chr"]) & (mexcess > self.p["rel_thresh"])).float()
-        pstrength = ((mexcess - self.p["rel_thresh"]) / max(self.p["full_strength_span"], 1e-3)).clamp(0, 1)
+        ex_a, ex_b = a2 - a_ref, b2 - b_ref
+        mexcess = ex_a * um_a + ex_b * um_b
+        # angular gate: accept only excess hues within +-hue_halfwidth of the target
+        # direction (mirrors purple_cast.py). soft_step smoothstep feathers the edge.
+        perp = -ex_a * um_b + ex_b * um_a
+        ang = torch.atan2(perp.abs(), mexcess) * (180.0 / np.pi)        # 0 = on target hue
+        hw, hsoft = self.p["hue_halfwidth"] + 1e-6, self.p["hue_softness"]
+        if hsoft > 0:
+            t = ((-ang - (-hw)) / (2.0 * hsoft) + 0.5).clamp(0, 1)
+            hue_w = t * t * (3.0 - 2.0 * t)
+        else:
+            hue_w = (ang < hw).float()
+        pshadow = ((chroma2 > self.p["fringe_min_chroma"]) & (mexcess > self.p["excess_thresh"]) & (hue_w > 0)).float()
+        pstrength = (((mexcess - self.p["excess_thresh"]) / max(self.p["full_strength_span"], 1e-3)).clamp(0, 1)) * hue_w
         pout, pkeep = self._pass(lab2, self.p, "p", pcaster, pshadow, pstrength)
         px = pkeep * pout + (1.0 - pkeep) * gx                      # composite purple
         y = (px.clamp(0.0, 1.0) * 255.0).round()

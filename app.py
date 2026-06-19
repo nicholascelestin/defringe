@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-"""Defringe tuner — tabbed Gradio app over the canonical `algorithm/` package.
+"""Defringe tuner — a tabbed Gradio app over defringe_algorithm.py.
 
-Tab 0  Source   pick a still, or seek the full video and extract a 10s clip to
-                memory; choose the current frame (shared by tabs 1/2/3).
-Tab 1  Green    green_cast (toggle on/off) + knobs. Output feeds tab 2.
-Tab 2  Purple   defringe (toggle on/off) applied to tab 1's output.
-Tab 3  Temporal flicker stats over current frame + next 5 (extracted clip only).
+Source: pick a still or extract a 10s video clip. Green / Purple: tune each pass
+(toggleable) live. Temporal: flicker stats over 6 frames. ONNX export: bake the
+current settings into a portable model. Every slider declares its algorithm key,
+so one registry drives the pipeline call, the persistence, and the live reset.
 
-Logic lives in algorithm/; this app only orchestrates and renders. One handler,
-`run_chain`, evaluates the whole pipeline (frame -> [green] -> [purple]) so the
-chain is always live with the actual knob values; every control triggers it.
-
-Run (dedicated venv):  .venv/bin/python app.py
+Run:  .venv/bin/python app.py
 """
 import os
 import sys
+import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -26,20 +23,19 @@ import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 
 import video_io
-import algorithm as alg
+import defringe_algorithm as alg
 
-STILLS = {"inside": "source/inside.webp", "horses": "source/horses.png",
-          "building": "source/building.webp", "people": "source/people.webp"}
-VIDEO = "source/sanguo-ep01-10min.mp4"
-CLIP_SECS, PREVIEW_W = 10, 720      # full-res 10s/1080p clip would be ~1.5 GB
-ONNX_PATH = "delivery/cast_defringe.onnx"   # exported model (green->purple cast)
-ONNX_PREVIEW = "delivery/onnx_preview.mp4"  # last ONNX-on-clip render (gitignored)
+PREVIEW_W = 720          # downscale width for in-memory clips (full-res 1080p ~1.5 GB)
+DEFAULT_SECS = 10        # clip length to grab into memory, in seconds
+ONNX_PATH = "cast_defringe.onnx"            # exported model (green->purple cast)
+ONNX_PREVIEW = "onnx_preview.mp4"           # last ONNX-on-clip render (gitignored)
+G, PC = alg.GREEN_CAST, alg.PURPLE_CAST
 
-print("preloading stills...")
-STILL_IMG = {k: video_io.read_image(v) for k, v in STILLS.items()}
-VW, VH, VNB, VFPS = video_io.probe(VIDEO)
-VDUR = VNB / VFPS if VFPS else 0
-print(f"  video {VW}x{VH} {VFPS:.0f}fps {VDUR:.0f}s")
+if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+    print("⚠ ffmpeg/ffprobe not on PATH — video upload needs them "
+          "(brew install ffmpeg / apt install ffmpeg). Images still work.")
+
+CASTER_RED, CASTER_GOLD, FRINGE_GREEN = (230., 60., 50.), (255., 215., 0.), (0., 255., 120.)
 
 
 def _overlay(rgb, alpha, thr=0.02):
@@ -47,104 +43,165 @@ def _overlay(rgb, alpha, thr=0.02):
     return np.where((alpha > thr)[..., None], 0.2 * rgb + 0.8 * over, rgb).astype(np.uint8)
 
 
-def current_frame(source, clip, idx):
-    if source == "extracted clip":
-        if clip is None or len(clip) == 0:
-            return None
+def detect_view(base, info, caster_color):
+    """Tint casters and corrected pixels over a dimmed frame (the detect image)."""
+    dm = 0.45 * base
+    if info["caster"].any():
+        dm[info["caster"]] = 0.5 * dm[info["caster"]] + 0.5 * np.array(caster_color)
+    lit = info["alpha"] > 0.05
+    dm[lit] = 0.18 * dm[lit] + 0.82 * np.array(FRINGE_GREEN)
+    return np.clip(dm, 0, 255).astype(np.uint8)
+
+
+def stat_line(name, info):
+    a = info["alpha"]
+    return f"{name} sel(a>0.1): {100 * np.mean(a > 0.1):.3f}%  a-max {a.max():.2f}"
+
+
+def current_frame(still, clip, idx):
+    """The frame the pipeline tunes on: an uploaded still, else the current clip frame."""
+    if still is not None:
+        return still
+    if clip is not None and len(clip):
         return clip[int(np.clip(idx, 0, len(clip) - 1))]
-    return STILL_IMG[source]
+    return None
 
 
-def run_chain(source, clip, idx,
-              g_on, cast_chr, band_lo, band_hi, glo, ghi, gchr, radius,
-              minar, fspan, amax, grow, feather, gtone,
-              g_area_soft, g_radius_soft, g_tdir,
-              pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-              pc_chr, pc_thue, pc_relthr, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir):
-    """frame -> [green] -> [purple] (casting-shadow model: bright highlight =
-    caster, magenta = shadow). Returns all ten image/stat outputs."""
-    rgb = current_frame(source, clip, idx)
+# --- slider registry: each slider knows its algorithm key, so one map serves the
+# pipeline call, persistence (user_defaults.json, keyed s0.., label-guarded), and
+# the JS reset. REG is creation order (persistence); GREEN_REG/PURPLE_REG feed the
+# per-pass kwargs. ---
+DEFAULTS_FILE = Path(__file__).with_name("user_defaults.json")
+
+
+def _load_saved():
+    try:
+        return json.loads(DEFAULTS_FILE.read_text())   # {persist_key: {"label", "value"}}
+    except Exception:
+        return {}
+
+
+SAVED = _load_saved()
+REG, GREEN_REG, PURPLE_REG = [], [], []
+_sn = [0]
+
+
+def S(reg, key, lo, hi, step, label, info=None):
+    """Slider for algorithm param `key`, default seeded from the pass's defaults
+    then user_defaults.json; registered for the kwargs map, persistence, and reset."""
+    persist = f"s{_sn[0]}"; _sn[0] += 1
+    default = (G if reg is GREEN_REG else PC)[key]
+    saved = SAVED.get(persist)
+    if saved and saved.get("label") == label:        # label guard: ignore stale keys
+        default = saved["value"]
+    comp = gr.Slider(lo, hi, value=default, step=step, label=label, info=info, elem_id=f"def_{persist}")
+    entry = {"persist": persist, "label": label, "key": key, "comp": comp}
+    reg.append(entry); REG.append(entry)
+    return comp
+
+
+def build_params(reg, vals):
+    """Map a pass's slider values to its algorithm kwargs (registry order)."""
+    return {e["key"]: v for e, v in zip(reg, vals)}
+
+
+def restart_app():
+    """Re-exec the process: a fresh server on the same port (also picks up code edits).
+    The in-memory clip is lost; saved defaults persist on disk."""
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+def save_defaults(*vals):
+    """Persist current slider values and hand the client a fresh {elem_id: value}
+    map (RESET_JS consumes it to retarget per-slider reset without a restart)."""
+    data = {c["persist"]: {"label": c["label"], "value": v} for c, v in zip(REG, vals)}
+    DEFAULTS_FILE.write_text(json.dumps(data, indent=2))
+    client = {f"def_{c['persist']}": v for c, v in zip(REG, vals)}
+    return json.dumps(client), f"✓ saved {len(data)} settings as default"
+
+
+def _split(vals):
+    return build_params(GREEN_REG, vals[:len(GREEN_REG)]), build_params(PURPLE_REG, vals[len(GREEN_REG):])
+
+
+def run_chain(still, clip, idx, g_on, pc_on, *vals):
+    """frame -> [green] -> [purple]; returns the six tab-1 / tab-2 outputs."""
+    rgb = current_frame(still, clip, idx)
     if rgb is None:
-        blank = np.zeros((80, 80, 3), np.uint8)
-        return (None, blank, blank, "no frame", None, blank, blank, "no frame")
+        return None, None, "no frame", None, None, "no frame"
+    green, purple = _split(vals)
 
-    # --- green stage ---
     if g_on:
-        gout, ginfo = alg.green_cast(
-            rgb, cast_chr=cast_chr, band_lo=band_lo, band_hi=band_hi,
-            green_lo=glo, green_hi=ghi, green_chr=gchr,
-            cast_radius=int(radius), min_area=int(minar), full_strength_span=fspan,
-            max_strength=amax, repair_spread=int(grow), feather=feather, tone_correction_radius=gtone,
-            area_soft=g_area_soft, radius_soft=g_radius_soft, tone_directionality=g_tdir)
-        dm = 0.45 * rgb
-        if ginfo["caster"].any():
-            dm[ginfo["caster"]] = 0.5 * dm[ginfo["caster"]] + 0.5 * np.array([230., 60., 50.])
-        sh = ginfo["alpha"] > 0.05
-        dm[sh] = 0.18 * dm[sh] + 0.82 * np.array([0., 255., 120.])
-        g_detect = np.clip(dm, 0, 255).astype(np.uint8)
-        g_alpha = _overlay(rgb, ginfo["alpha"])
-        g_stat = f"green sel(a>0.1): {100*np.mean(ginfo['alpha']>0.1):.3f}%  a-max {ginfo['alpha'].max():.2f}"
+        gout, ginfo = alg.green_cast(rgb, **green)
+        g_detect = [(detect_view(rgb, ginfo, CASTER_RED), "casters (red) + shadows (green)"),
+                    (_overlay(rgb, ginfo["alpha"]), "alpha")]
+        g_stat = stat_line("green", ginfo)
     else:
-        gout, g_detect, g_alpha, g_stat = rgb, rgb, rgb, "green DISABLED (passthrough)"
+        gout, g_stat = rgb, "green DISABLED (passthrough)"
+        g_detect = [(rgb, "casters (red) + shadows (green)"), (rgb, "alpha")]
 
-    # --- purple stage: casting-shadow model (bright highlight -> magenta fringe) ---
     if pc_on:
-        pcout, pcinfo = alg.purple_cast(
-            gout, bright_L=pc_bright, min_area=int(pc_minar), area_soft=pc_area_soft,
-            cast_radius=int(pc_radius), radius_soft=pc_radius_soft, mag_chr=pc_chr,
-            target_hue=pc_thue, full_strength_span=pc_fspan, max_strength=pc_amax,
-            repair_spread=int(pc_grow), feather=pc_feather, tone_correction_radius=pc_tone,
-            tone_directionality=pc_tdir, rel_thresh=pc_relthr)
-        dm = 0.45 * gout
-        if pcinfo["caster"].any():
-            dm[pcinfo["caster"]] = 0.5 * dm[pcinfo["caster"]] + 0.5 * np.array([255., 215., 0.])
-        psh = pcinfo["alpha"] > 0.05
-        dm[psh] = 0.18 * dm[psh] + 0.82 * np.array([0., 255., 120.])
-        pc_detect = np.clip(dm, 0, 255).astype(np.uint8)
-        pc_alpha = _overlay(gout, pcinfo["alpha"])
-        pc_stat = f"purple sel(a>0.1): {100*np.mean(pcinfo['alpha']>0.1):.3f}%  a-max {pcinfo['alpha'].max():.2f}"
+        pcout, pcinfo = alg.purple_cast(gout, **purple)
+        pc_detect = [(detect_view(gout, pcinfo, CASTER_GOLD), "casters (gold) + fringe (green)"),
+                     (_overlay(gout, pcinfo["alpha"]), "alpha")]
+        pc_stat = stat_line("purple", pcinfo)
     else:
-        pcout, pc_detect, pc_alpha, pc_stat = gout, gout, gout, "purple DISABLED (passthrough)"
+        pcout, pc_stat = gout, "purple DISABLED (passthrough)"
+        pc_detect = [(gout, "casters (gold) + fringe (green)"), (gout, "alpha")]
 
     g_compare = [(rgb, "input"), (gout, "green-corrected → tab 2")]
-    pc_compare = [(gout, "input (green-corrected)"), (pcout, "final (green+purple)")]
-    return (g_compare, g_detect, g_alpha, g_stat,       # tab 1 (green)
-            pc_compare, pc_detect, pc_alpha, pc_stat)   # tab 2 (purple)
+    pc_compare = [(gout, "green-corrected"), (pcout, "final")]
+    return (g_compare, g_detect, g_stat,
+            pc_compare, pc_detect, pc_stat)
 
 
-def seek_preview(start_sec):
+def on_upload(path):
+    """Route an upload: an image becomes the tuning frame; a video reveals the seek /
+    seconds / full-res / extract controls. Returns updates across the Source tab."""
+    hide, off = gr.update(visible=False), gr.update(interactive=False)
+    if not path:                                          # cleared
+        return (None, None, None, "", None, None,
+                hide, hide, hide, hide, hide, hide, hide, off, off)
+    if video_io.is_video(path):
+        w, h, nb, fps = video_io.probe(path)
+        dur = nb / fps if fps else 0
+        info = f"video {w}x{h} {fps:.0f}fps {dur:.0f}s — set seconds & seek, then Extract"
+        return (None, None, path, info, video_io.read_frame(path, 0.0, max_w=960), None,
+                gr.update(visible=True, maximum=max(0, dur), value=0),       # seek
+                gr.update(visible=True), gr.update(visible=True), gr.update(visible=True),  # secs/full/extract
+                hide, hide, hide, off, off)               # clip scrubbers + clip-only buttons (need a clip)
+    img = video_io.read_image(path)
+    return (img, None, None, f"image {img.shape[1]}x{img.shape[0]}", None, img,
+            hide, hide, hide, hide, hide, hide, hide, off, off)
+
+
+def seek_preview(video_path, start_sec):
     """Single frame at the seek point, so you can see where the clip will start."""
-    return video_io.read_frame(VIDEO, float(start_sec), max_w=960)
+    if not video_path:
+        return None
+    return video_io.read_frame(video_path, float(start_sec), max_w=960)
 
 
-def extract_clip(start_sec, full_res):
+def extract_clip(video_path, start_sec, secs, full_res):
+    """Decode `secs` seconds from `video_path` into memory; the clip becomes the active
+    source (clears any uploaded still)."""
+    if not video_path:
+        return (None, None, "Upload a video first.", None, gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=False), 25.0)
     max_w = None if full_res else PREVIEW_W
-    frames, fps = video_io.read_clip(VIDEO, float(start_sec), CLIP_SECS, max_w=max_w)
+    frames, fps = video_io.read_clip(video_path, float(start_sec), float(secs), max_w=max_w)
     n = len(frames)
     info = (f"{n} frames @ {fps:.0f}fps from {start_sec:.0f}s "
             f"({frames.shape[2]}x{frames.shape[1]}, ~{frames.nbytes/1e6:.0f} MB"
             f"{' · FULL RES' if full_res else ''})")
-    upd = gr.update(maximum=max(0, n - 1), value=0)
-    vis = gr.update(maximum=max(0, n - 1), value=0, visible=True)   # mirrors in tabs 1/2/3
-    # Switch the active source to the freshly extracted clip; otherwise the frame
-    # slider keeps resolving against the still and scrubbing shows a frozen image.
-    # Enable the Temporal button here directly — a programmatic source change does
-    # not reliably re-fire t0_source.change, so we can't lean on frame_controls.
-    return ("extracted clip", frames, info, frames[0], upd, vis, vis, vis,
-            gr.update(interactive=True), gr.update(interactive=True))
+    scrub = gr.update(maximum=max(0, n - 1), value=0, visible=True)
+    return (None, frames, info, frames[0], gr.update(maximum=max(0, n - 1), value=0),
+            scrub, scrub, scrub, gr.update(interactive=True), gr.update(interactive=True), fps)
 
 
-def pick_preview(source, clip, idx):
-    f = current_frame(source, clip, idx)
+def pick_preview(still, clip, idx):
+    f = current_frame(still, clip, idx)
     return f if f is not None else np.zeros((80, 80, 3), np.uint8)
-
-
-def frame_controls(source, clip):
-    """Reveal the in-tab frame scrubbers (tabs 1/2/3) and enable the Temporal
-    analyze button only for an extracted clip; size scrubbers to the clip."""
-    on = source == "extracted clip" and clip is not None and len(clip) > 0
-    u = gr.update(visible=True, maximum=max(0, len(clip) - 1)) if on else gr.update(visible=False)
-    return u, u, u, gr.update(interactive=on), gr.update(interactive=on)
 
 
 def mirror_frame(v):
@@ -192,41 +249,25 @@ def _stage_metrics(out, inp, alphas, n):
                 per_pair=per_pair)
 
 
-def temporal_analyze(source, clip, idx,
-              g_on, cast_chr, band_lo, band_hi, glo, ghi, gchr, radius,
-              minar, fspan, amax, grow, feather, gtone,
-              g_area_soft, g_radius_soft, g_tdir,
-              pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-              pc_chr, pc_thue, pc_relthr, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir):
-    """Run the live pipeline (green -> purple cast) over the current frame + next 5; report flicker."""
-    if source != "extracted clip" or clip is None or len(clip) == 0:
-        return None, None, "Select an **extracted clip** in Tab 0 first.", None
+def temporal_analyze(still, clip, idx, g_on, pc_on, *vals):
+    """Run the live pipeline over the current frame + next 5; report flicker."""
+    if clip is None or len(clip) == 0:
+        return None, None, "Extract a video clip in Tab 0 first.", None
     i0 = int(np.clip(idx, 0, len(clip) - 1))
     sel = clip[i0:i0 + TEMPORAL_N]
     n = len(sel)
     if n < 2:
         return None, None, (f"Frame {i0} is too close to the clip end "
                             f"({n} frame(s)); pick an earlier start frame."), None
+    green, purple = _split(vals)
     src, greens, finals, ga, pa = [], [], [], [], []
     for fr in sel:
         if g_on:
-            gout, ginfo = alg.green_cast(
-                fr, cast_chr=cast_chr, band_lo=band_lo, band_hi=band_hi,
-                green_lo=glo, green_hi=ghi, green_chr=gchr,
-                cast_radius=int(radius), min_area=int(minar), full_strength_span=fspan,
-                max_strength=amax, repair_spread=int(grow), feather=feather, tone_correction_radius=gtone,
-                area_soft=g_area_soft, radius_soft=g_radius_soft, tone_directionality=g_tdir)
-            galpha = ginfo["alpha"]
+            gout, ginfo = alg.green_cast(fr, **green); galpha = ginfo["alpha"]
         else:
             gout, galpha = fr, np.zeros(fr.shape[:2], np.float32)
         if pc_on:
-            pout, pinfo = alg.purple_cast(
-                gout, bright_L=pc_bright, min_area=int(pc_minar), area_soft=pc_area_soft,
-                cast_radius=int(pc_radius), radius_soft=pc_radius_soft, mag_chr=pc_chr,
-                target_hue=pc_thue, full_strength_span=pc_fspan, max_strength=pc_amax,
-                repair_spread=int(pc_grow), feather=pc_feather, tone_correction_radius=pc_tone,
-                tone_directionality=pc_tdir, rel_thresh=pc_relthr)
-            palpha = pinfo["alpha"]
+            pout, pinfo = alg.purple_cast(gout, **purple); palpha = pinfo["alpha"]
         else:
             pout, palpha = gout, np.zeros(np.asarray(gout).shape[:2], np.float32)
         src.append(np.asarray(fr, np.float32)); greens.append(np.asarray(gout, np.float32))
@@ -236,8 +277,8 @@ def temporal_analyze(source, clip, idx,
     pm = _stage_metrics(finals, greens, pa, n)
     d_in = float(np.mean([np.abs(src[i] - src[i-1]).mean() for i in range(1, n)]))
 
-    # heatmap: per-pixel temporal std of the final correction (final - input),
-    # which isolates algorithm-induced flicker from real scene motion.
+    # heatmap: per-pixel temporal std of the final correction, isolating
+    # algorithm-induced flicker from real scene motion.
     corr = np.stack([finals[i] - src[i] for i in range(n)], 0)
     fmap = corr.std(0).mean(-1)
     fmax = float(fmap.max())
@@ -260,34 +301,20 @@ def temporal_analyze(source, clip, idx,
     return heat, plot, stats, gallery
 
 
-def export_onnx(source, clip, idx,
-                g_on, cast_chr, band_lo, band_hi, glo, ghi, gchr, radius,
-                minar, fspan, amax, grow, feather, gtone,
-                g_area_soft, g_radius_soft, g_tdir,
-                pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-                pc_chr, pc_thue, pc_relthr, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir,
-                progress=gr.Progress()):
-    """Export green->purple_cast to ONNX (opset 17) using the LIVE slider settings.
-    A disabled pass (toggle off) is exported as a no-op via max_strength=0."""
+def export_onnx(still, clip, idx, g_on, pc_on, *vals, progress=gr.Progress()):
+    """Export the green->purple pipeline to ONNX (opset 17) from the live settings;
+    a disabled pass is baked as a no-op via max_opacity=0."""
     progress(0.05, desc="loading torch...")
     try:
         import torch
-        dpath = str((Path(__file__).parent / "delivery").resolve())
-        if dpath not in sys.path:
-            sys.path.insert(0, dpath)
         from cast_torch import Defringe
     except Exception as e:
-        return f"⚠️ Export extra not available — run `uv sync --extra export`.\n\n`{e}`"
-    green = dict(cast_chr=cast_chr, band_lo=band_lo, band_hi=band_hi, green_lo=glo, green_hi=ghi,
-                 green_chr=gchr, cast_radius=radius, min_area=minar, full_strength_span=fspan,
-                 max_strength=(amax if g_on else 0.0), repair_spread=grow, feather=feather,
-                 tone_correction_radius=gtone, area_soft=g_area_soft, radius_soft=g_radius_soft,
-                 tone_directionality=g_tdir)
-    purple = dict(bright_L=pc_bright, min_area=pc_minar, area_soft=pc_area_soft,
-                  cast_radius=pc_radius, radius_soft=pc_radius_soft, mag_chr=pc_chr,
-                  target_hue=pc_thue, rel_thresh=pc_relthr, full_strength_span=pc_fspan,
-                  max_strength=(pc_amax if pc_on else 0.0), repair_spread=pc_grow,
-                  feather=pc_feather, tone_correction_radius=pc_tone, tone_directionality=pc_tdir)
+        return f"⚠️ torch not available — try `uv sync` to reinstall deps.\n\n`{e}`"
+    green, purple = _split(vals)
+    if not g_on:
+        green["max_opacity"] = 0.0
+    if not pc_on:
+        purple["max_opacity"] = 0.0
     progress(0.3, desc="building model from current settings...")
     model = Defringe(green=green, purple=purple).eval()
     dummy = torch.zeros(1, 540, 960, 3, dtype=torch.uint8)
@@ -303,16 +330,16 @@ def export_onnx(source, clip, idx,
             f"Dynamic N/H/W, uint8 in/out. (~0.1 mean ΔRGB vs the exact numpy.)")
 
 
-def run_onnx_clip(source, clip, progress=gr.Progress()):
+def run_onnx_clip(clip, fps, progress=gr.Progress()):
     """Run the exported ONNX over the whole in-memory clip; return a playable video."""
-    if source != "extracted clip" or clip is None or len(clip) == 0:
-        return None, "Select an **extracted clip** in Tab 0 first."
+    if clip is None or len(clip) == 0:
+        return None, "Extract a video clip in Tab 0 first."
     if not os.path.exists(ONNX_PATH):
         return None, "Press **Export ONNX** first."
     try:
         import onnxruntime as ort
     except Exception as e:
-        return None, f"⚠️ onnxruntime not available — `uv sync --extra export`.\n\n`{e}`"
+        return None, f"⚠️ onnxruntime not available — try `uv sync`.\n\n`{e}`"
     sess = ort.InferenceSession(ONNX_PATH, providers=["CPUExecutionProvider"])
     n, B, outs = len(clip), 4, []
     for i in progress.tqdm(range(0, n, B), desc="ONNX defringe"):
@@ -324,23 +351,51 @@ def run_onnx_clip(source, clip, progress=gr.Progress()):
         # assumes 709 over swscale's 601 default -> the preview colour-shifts vs the
         # gallery stills. (Same fix as the Colab notebook's COLOR_MODE="bt709".)
         ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-         "-s", f"{w}x{h}", "-r", f"{VFPS:.0f}", "-color_range", "pc", "-i", "-", "-an",
+         "-s", f"{w}x{h}", "-r", f"{fps:.0f}", "-color_range", "pc", "-i", "-", "-an",
          "-vf", "scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p,"
                 "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709",
          "-c:v", "libx264", "-crf", "16", "-preset", "fast", "-pix_fmt", "yuv420p", ONNX_PREVIEW],
         stdin=subprocess.PIPE)
     proc.stdin.write(np.ascontiguousarray(frames, np.uint8).tobytes())
     proc.stdin.close(); proc.wait()
-    return ONNX_PREVIEW, f"✅ {n} frames @ {VFPS:.0f}fps through ONNX → video below ({w}×{h})."
+    return ONNX_PREVIEW, f"✅ {n} frames @ {fps:.0f}fps through ONNX → video below ({w}×{h})."
 
 
-S = lambda lo, hi, v, st, lbl, info=None: gr.Slider(lo, hi, value=v, step=st, label=lbl, info=info)
-G, PC = alg.GREEN_CAST, alg.PURPLE_CAST
+# Capture-phase handler that intercepts Gradio's per-slider reset (↺) and applies
+# window.__defaults instead of the build-time value, firing input+pointerup so the
+# pipeline re-runs. Seeds the map from the hidden #defaults_blob textbox per load.
+RESET_JS = """
+() => {
+  const seed = () => {
+    try {
+      const t = document.querySelector('#defaults_blob textarea, #defaults_blob input');
+      if (t) window.__defaults = JSON.parse(t.value || '{}');
+    } catch (e) {}
+  };
+  seed();
+  if (!window.__resetHijack) {
+    window.__resetHijack = true;
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest && e.target.closest('.reset-button');
+      if (!btn) return;
+      const block = btn.closest('[id^="def_"]');
+      if (!block) return;
+      const d = (window.__defaults || {})[block.id];
+      if (d === undefined) return;                 // unknown -> let native reset run
+      e.preventDefault(); e.stopImmediatePropagation();
+      block.querySelectorAll('input').forEach(inp => {
+        inp.value = d;
+        inp.dispatchEvent(new Event('input', {bubbles: true}));
+        inp.dispatchEvent(new Event('pointerup', {bubbles: true}));
+      });
+    }, true);
+  }
+}
+"""
 
-# Hints are written as Gradio `info=` (always renders as small text), then an
-# on-load script relocates each into a native HTML `title` tooltip and hides the
-# inline text — real hover tooltips with zero layout cost, degrading gracefully
-# to the small text if the script ever fails to run.
+# Relocate each Gradio `info=` hint into a native HTML `title` tooltip and hide the
+# inline text — real hover tooltips at zero layout cost, degrading to the small text
+# if the script never runs.
 TOOLTIP_JS = """
 () => {
   const relocate = () => {
@@ -361,93 +416,108 @@ TOOLTIP_JS = """
 """
 
 with gr.Blocks(title="Defringe tuner") as demo:
-    gr.Markdown("# Defringe tuner\n"
-                "Remove green & purple colour fringing from stills and video — only chroma is "
-                "touched, lightness stays put.\n\n"
-                "**Flow:** pick a frame in **Source** → tune **Green**, then **Purple** "
-                "(each toggleable) → check **Temporal** for flicker → **ONNX export** to ship. "
-                "Hover any control for what it does.")
-    clip_state = gr.State(None)
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("# Defringe tuner\n"
+                        "Remove green & purple colour fringing from stills and video — only chroma is "
+                        "touched, lightness stays put.\n\n"
+                        "**Flow:** pick a frame in **Source** → tune **Green**, then **Purple** "
+                        "(each toggleable) → check **Temporal** for flicker → **ONNX export** to ship. "
+                        "Hover any control for what it does.")
+        with gr.Column(scale=0, min_width=300):
+            with gr.Row():
+                save_def_btn = gr.Button("💾 Save settings", size="sm")
+                restart_btn = gr.Button("↻ Restart app", size="sm")
+            save_def_stat = gr.Markdown("")
+    defaults_blob = gr.Textbox(visible=False, elem_id="defaults_blob")
+    clip_state = gr.State(None)     # extracted video clip (frames)
+    still_state = gr.State(None)    # uploaded image (when the source is a still)
+    video_state = gr.State(None)    # uploaded video path (for seek/extract)
+    fps_state = gr.State(25.0)      # the extracted clip's fps (for ONNX re-encode)
 
     with gr.Tab("0 · Source"):
-        gr.Markdown("Choose the frame to tune on — a still, or a clip pulled from the video. "
-                    "This selection feeds the Green and Purple tabs.")
+        gr.Markdown("Upload an **image** to tune on directly, or a **video** to seek into and "
+                    "extract a clip. This feeds the Green and Purple tabs.")
         with gr.Row():
             with gr.Column(scale=1):
-                t0_source = gr.Radio(["extracted clip", *STILLS], value="inside", label="current source", info="Which image feeds tabs 1–2: a still, or the clip extracted below.")
-                gr.Markdown(f"**Video** (full file {VDUR:.0f}s)")
-                t0_start = gr.Slider(0, max(1, VDUR - CLIP_SECS), value=0, step=1, label=f"seek (s) — extracts {CLIP_SECS}s", info="Where in the full video to grab the clip from.")
-                t0_full = gr.Checkbox(False, label="full-res clip (~1.5 GB; off = 720px)", info="On = full-res (slow, ~1.5 GB); off = 720px for snappy tuning.")
-                t0_extract = gr.Button("Extract 10s clip → memory", variant="primary")
-                t0_info = gr.Textbox(label="clip info", interactive=False)
+                t0_upload = gr.File(file_types=["image", "video"], type="filepath", label="source — image or video")
+                t0_seek = gr.Slider(0, 1, value=0, step=1, label="seek (s)", visible=False, info="Where in the video to start the clip.")
+                t0_secs = gr.Slider(1, 30, value=DEFAULT_SECS, step=1, label="seconds to grab into memory", visible=False, info="Clip length decoded into RAM (longer = more memory).")
+                t0_full = gr.Checkbox(False, label="full-res clip (~1.5 GB; off = 720px)", visible=False, info="On = full-res (slow, big); off = 720px for snappy tuning.")
+                t0_extract = gr.Button("Extract clip → memory", variant="primary", visible=False)
+                t0_info = gr.Textbox(label="info", interactive=False)
                 t0_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", info="Which clip frame to preview and tune on.")
             with gr.Column(scale=2):
-                t0_seek = gr.Image(label="seek-point preview (full video) — where the clip starts", height=300)
+                t0_seekimg = gr.Image(label="seek-point preview — where the clip starts", height=300)
                 t0_preview = gr.Image(label="current frame (feeds tabs 1 & 2)", height=300)
 
-    with gr.Tab("1 · Green defringe"):
+    with gr.Tab("1 · Green Defringe"):
         gr.Markdown("Removes green fringe cast by saturated warm (red/purple) sources — "
                     "the first pass in the chain.")
         with gr.Row():
             with gr.Column(scale=1):
-                g_on = gr.Checkbox(True, label="green pass ENABLED", info="Turn the green pass on/off (off = passes straight to the purple tab).")
+                g_on = gr.Checkbox(True, label="Enable", info="Turn the green pass on/off (off = passes straight to the purple tab).")
                 gr.Markdown("**Casters (warm)**")
-                g_cast_chr = S(0, 30, G["cast_chr"], 0.5, "Minimum Chroma", "How saturated a warm source must be to count as a fringe-caster. Lower = more casters.")
-                g_band_lo = S(-90, 0, G["band_lo"], 1, "Hue Floor", "Low edge of the caster hue range; lower reaches toward purple.")
-                g_band_hi = S(0, 90, G["band_hi"], 1, "Hue Ceiling", "High edge of the caster hue range; higher reaches toward orange.")
-                g_minar = S(0, 300, G["min_area"], 1, "Minimum Area", "Ignore caster blobs smaller than this (px) to reject noise.")
-                g_area_soft = S(0, 1, G["area_soft"], 0.05, "Area Softness", "Fade marginal-size casters in/out instead of popping — for temporal stability. 0 = hard cutoff.")
-                g_radius = S(2, 60, G["cast_radius"], 1, "Cast Reach", "How far from a caster (px) to look for its green fringe.")
-                g_radius_soft = S(0, 1, G["radius_soft"], 0.05, "Reach Softness", "Fade the fringe out with distance instead of a hard edge — for temporal stability. 0 = hard cutoff.")
+                S(GREEN_REG, "caster_min_chroma", 0, 30, 0.5, "Minimum Chroma", "How saturated a warm source must be to count as a fringe-caster. Lower = more casters.")
+                S(GREEN_REG, "caster_hue_lo", -90, 0, 1, "Hue Floor", "Low edge of the caster hue range; lower reaches toward purple.")
+                S(GREEN_REG, "caster_hue_hi", 0, 90, 1, "Hue Ceiling", "High edge of the caster hue range; higher reaches toward orange.")
+                S(GREEN_REG, "min_area", 0, 300, 1, "Minimum Area", "Ignore caster blobs smaller than this (px) to reject noise.")
+                S(GREEN_REG, "cast_radius", 2, 60, 1, "Cast Reach", "How far from a caster (px) to look for its green fringe.")
                 gr.Markdown("**Shadows (cool)**")
-                g_gchr = S(0, 15, G["green_chr"], 0.1, "Minimum Chroma", "How saturated a pixel must be to count as green fringe. Lower = catch fainter fringe.")
-                g_glo = S(-140, 0, G["green_lo"], 1, "Hue Floor", "Low edge of the green-fringe hue range; lower reaches toward green/yellow.")
-                g_ghi = S(0, 140, G["green_hi"], 1, "Hue Ceiling", "High edge of the green-fringe hue range; higher reaches toward blue/violet.")
+                S(GREEN_REG, "fringe_min_chroma", 0, 15, 0.1, "Minimum Chroma", "How saturated a pixel must be to count as green fringe. Lower = catch fainter fringe.")
+                S(GREEN_REG, "fringe_hue_lo", -140, 0, 1, "Hue Floor", "Low edge of the green-fringe hue range; lower reaches toward green/yellow.")
+                S(GREEN_REG, "fringe_hue_hi", 0, 140, 1, "Hue Ceiling", "High edge of the green-fringe hue range; higher reaches toward blue/violet.")
                 gr.Markdown("**Repair**")
-                g_fspan = S(1, 30, G["full_strength_span"], 0.5, "Full-Strength Span", "Extra chroma above Minimum Chroma that reaches full correction. Wider = gentler.")
-                g_amax = S(0, 1, G["max_strength"], 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive.")
-                g_grow = S(0, 20, G["repair_spread"], 1, "Repair Spread", "Grow the corrected region outward by this many px before feathering.")
-                g_feather = S(0, 5, G["feather"], 0.1, "Feather", "Soften/blur the correction's edge (px).")
-                g_tone = S(5, 50, G["tone_correction_radius"], 1, "Tone Correction Radius", "How far out (px) to sample the clean colour fringe is pulled toward.")
-                g_tdir = S(0, 1, G["tone_directionality"], 0.05, "Tone Directionality", "Pull repair colour from the cast side, not the caster. 0 = all directions, 1 = away from caster.")
+                S(GREEN_REG, "max_opacity", 0, 1, 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive.")
+                S(GREEN_REG, "repair_spread", 0, 20, 1, "Repair Spread", "Grow the corrected region outward by this many px before feathering.")
+                S(GREEN_REG, "feather", 0, 5, 0.1, "Feather", "Soften/blur the correction's edge (px).")
+                with gr.Accordion("Advanced", open=False):
+                    S(GREEN_REG, "area_softness", 0, 1, 0.05, "Area Softness", "Fade marginal-size casters in/out instead of popping — for temporal stability. 0 = hard cutoff.")
+                    S(GREEN_REG, "radius_softness", 0, 1, 0.05, "Reach Softness", "Fade the fringe out with distance instead of a hard edge — for temporal stability. 0 = hard cutoff.")
+                    S(GREEN_REG, "full_strength_span", 1, 30, 0.5, "Full-Strength Span", "Extra chroma above Minimum Chroma that reaches full correction. Wider = gentler.")
+                    S(GREEN_REG, "tone_correction_radius", 5, 50, 1, "Tone Correction Radius", "How far out (px) to sample the clean colour fringe is pulled toward.")
+                    S(GREEN_REG, "tone_directionality", 0, 1, 0.05, "Tone Directionality", "Pull repair colour from the cast side, not the caster. 0 = all directions, 1 = away from caster.")
             with gr.Column(scale=2):
                 t1_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", visible=False)
                 g_stat = gr.Textbox(label="stats", interactive=False)
-                g_detect = gr.Image(label="casters (red) + shadows (green)", height=360)
-                g_compare = gr.Gallery(label="input ↔ green-corrected (→ tab 2) — click an image, then arrow/swipe",
+                g_detect = gr.Gallery(label="casters + alpha",
+                                      columns=2, object_fit="contain", preview=False)
+                g_compare = gr.Gallery(label="input ↔ green-corrected (→ tab 2)",
                                        columns=2, object_fit="contain", preview=False)
-                g_alpha = gr.Image(label="alpha", height=230)
 
-    with gr.Tab("2 · Purple defringe"):
+    with gr.Tab("2 · Purple Defringe"):
         gr.Markdown("Removes magenta/violet fringe cast by blown highlights — "
                     "runs on top of the green pass's output.")
         with gr.Row():
             with gr.Column(scale=1):
-                pc_on = gr.Checkbox(True, label="purple pass ENABLED", info="Turn the purple pass on/off (runs after the green pass).")
+                pc_on = gr.Checkbox(True, label="Enable", info="Turn the purple pass on/off (runs after the green pass).")
                 gr.Markdown("**Casters (bright)**")
-                pc_bright = S(50, 100, PC["bright_L"], 1, "Minimum Lightness", "How bright a highlight must be to count as a fringe-caster.")
-                pc_minar = S(0, 300, PC["min_area"], 1, "Minimum Area", "Ignore highlight blobs smaller than this (px).")
-                pc_area_soft = S(0, 1, PC["area_soft"], 0.05, "Area Softness", "Fade marginal highlights in/out instead of popping — for temporal stability. 0 = hard cutoff.")
-                pc_radius = S(2, 60, PC["cast_radius"], 1, "Cast Reach", "How far from a highlight (px) to look for its magenta fringe.")
-                pc_radius_soft = S(0, 1, PC["radius_soft"], 0.05, "Reach Softness", "Fade the fringe out with distance instead of a hard edge — for temporal stability. 0 = hard cutoff.")
+                S(PURPLE_REG, "caster_min_lightness", 50, 100, 1, "Minimum Lightness", "How bright a highlight must be to count as a fringe-caster.")
+                S(PURPLE_REG, "min_area", 0, 300, 1, "Minimum Area", "Ignore highlight blobs smaller than this (px).")
+                S(PURPLE_REG, "cast_radius", 2, 60, 1, "Cast Reach", "How far from a highlight (px) to look for its magenta fringe.")
                 gr.Markdown("**Shadows (magenta)** — detected as a magenta *excess* over the scene's overall lighting tone")
-                pc_chr = S(0, 15, PC["mag_chr"], 0.1, "Minimum Chroma", "Chroma floor — pixels below this are never flagged (noise rejection).")
-                pc_thue = S(-45, 45, PC["target_hue"], 1, "Target Hue", "Shift the detected fringe colour: 0 = magenta, higher = toward red, lower = toward violet/blue.")
-                pc_relthr = S(0, 20, PC["rel_thresh"], 0.5, "Excess Threshold", "How much more magenta than the scene's overall tone a pixel must be to count as fringe. Higher = stricter.")
+                S(PURPLE_REG, "fringe_min_chroma", 0, 15, 0.1, "Minimum Chroma", "Chroma floor — pixels below this are never flagged (noise rejection).")
+                S(PURPLE_REG, "target_hue", -45, 45, 1, "Target Hue", "Shift the detected fringe colour: 0 = magenta, higher = toward red, lower = toward violet/blue.")
+                S(PURPLE_REG, "excess_thresh", 0, 20, 0.5, "Excess Threshold", "How much more magenta than the scene's overall tone a pixel must be to count as fringe. Higher = stricter.")
+                S(PURPLE_REG, "hue_halfwidth", 5, 90, 1, "Hue Range (±°)", "How wide a band of hues around Target Hue counts as fringe. 90 = essentially no limit; lower narrows it to colours nearer the target.")
                 gr.Markdown("**Repair**")
-                pc_fspan = S(1, 30, PC["full_strength_span"], 0.5, "Full-Strength Span", "Extra excess above the threshold that reaches full correction. Wider = gentler.")
-                pc_amax = S(0, 1, PC["max_strength"], 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive.")
-                pc_grow = S(0, 20, PC["repair_spread"], 1, "Repair Spread", "Grow the corrected region outward by this many px before feathering.")
-                pc_feather = S(0, 5, PC["feather"], 0.1, "Feather", "Soften/blur the correction's edge (px).")
-                pc_tone = S(5, 50, PC["tone_correction_radius"], 1, "Tone Correction Radius", "How far out (px) to sample the clean colour fringe is pulled toward.")
-                pc_tdir = S(0, 1, PC["tone_directionality"], 0.05, "Tone Directionality", "Pull repair colour from the fringe side, not the highlight. 0 = all directions, 1 = away from highlight.")
+                S(PURPLE_REG, "max_opacity", 0, 1, 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive.")
+                S(PURPLE_REG, "repair_spread", 0, 20, 1, "Repair Spread", "Grow the corrected region outward by this many px before feathering.")
+                S(PURPLE_REG, "feather", 0, 5, 0.1, "Feather", "Soften/blur the correction's edge (px).")
+                with gr.Accordion("Advanced", open=False):
+                    S(PURPLE_REG, "area_softness", 0, 1, 0.05, "Area Softness", "Fade marginal highlights in/out instead of popping — for temporal stability. 0 = hard cutoff.")
+                    S(PURPLE_REG, "radius_softness", 0, 1, 0.05, "Reach Softness", "Fade the fringe out with distance instead of a hard edge — for temporal stability. 0 = hard cutoff.")
+                    S(PURPLE_REG, "hue_softness", 0, 45, 1, "Hue Range Softness", "Feather (°) on the Hue Range edge — ramp the cutoff instead of a hard boundary, for temporal stability. 0 = hard edge.")
+                    S(PURPLE_REG, "full_strength_span", 1, 30, 0.5, "Full-Strength Span", "Extra excess above the threshold that reaches full correction. Wider = gentler.")
+                    S(PURPLE_REG, "tone_correction_radius", 5, 50, 1, "Tone Correction Radius", "How far out (px) to sample the clean colour fringe is pulled toward.")
+                    S(PURPLE_REG, "tone_directionality", 0, 1, 0.05, "Tone Directionality", "Pull repair colour from the fringe side, not the highlight. 0 = all directions, 1 = away from highlight.")
             with gr.Column(scale=2):
                 t2_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", visible=False)
                 pc_stat = gr.Textbox(label="stats", interactive=False)
-                pc_detect = gr.Image(label="casters (gold) + fringe (green)", height=360)
-                pc_compare = gr.Gallery(label="input (green-corrected) ↔ final (green+purple) — click an image, then arrow/swipe",
+                pc_detect = gr.Gallery(label="casters + alpha",
+                                       columns=2, object_fit="contain", preview=False)
+                pc_compare = gr.Gallery(label="green-corrected ↔ final",
                                         columns=2, object_fit="contain", preview=False)
-                pc_alpha = gr.Image(label="purple alpha", height=230)
 
     with gr.Tab("3 · Temporal Analysis"):
         gr.Markdown("Measures how much the correction flickers frame-to-frame under your current "
@@ -463,10 +533,9 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 temporal_map = gr.Image(label="flicker heatmap — temporal std of the correction", height=320)
                 temporal_plot = gr.Image(label="flicker per frame-pair", height=260)
 
-    with gr.Tab("ONNX export"):
+    with gr.Tab("4 · ONNX Export"):
         gr.Markdown("Bake your current settings into a portable ONNX model, then run it over the "
-                    "clip to preview. A close approximation of the exact passes; needs the "
-                    "`export` extra (`uv sync --extra export`).")
+                    "clip to preview. A close approximation of the exact passes.")
         with gr.Row():
             with gr.Column(scale=1):
                 onnx_export_btn = gr.Button("① Export ONNX (current settings)", variant="primary")
@@ -476,32 +545,27 @@ with gr.Blocks(title="Defringe tuner") as demo:
             with gr.Column(scale=2):
                 onnx_video = gr.Video(label="ONNX output — whole clip", height=420)
 
-    ins = [t0_source, clip_state, t0_frame,
-           g_on, g_cast_chr, g_band_lo, g_band_hi, g_glo, g_ghi, g_gchr,
-           g_radius, g_minar, g_fspan, g_amax, g_grow, g_feather, g_tone,
-           g_area_soft, g_radius_soft, g_tdir,
-           pc_on, pc_bright, pc_minar, pc_area_soft, pc_radius, pc_radius_soft,
-           pc_chr, pc_thue, pc_relthr, pc_fspan, pc_amax, pc_grow, pc_feather, pc_tone, pc_tdir]
-    outs = [g_compare, g_detect, g_alpha, g_stat,
-            pc_compare, pc_detect, pc_alpha, pc_stat]
+    ins = [still_state, clip_state, t0_frame, g_on, pc_on,
+           *[e["comp"] for e in GREEN_REG], *[e["comp"] for e in PURPLE_REG]]
+    outs = [g_compare, g_detect, g_stat,
+            pc_compare, pc_detect, pc_stat]
 
     for c in ins:
         (c.release if isinstance(c, gr.Slider) else c.change)(run_chain, ins, outs)
-    t0_extract.click(extract_clip, [t0_start, t0_full],
-                     [t0_source, clip_state, t0_info, t0_preview, t0_frame,
-                      t1_frame, t2_frame, t3_frame, temporal_btn, onnx_run_btn]) \
-              .then(run_chain, ins, outs)
-    t0_start.release(seek_preview, [t0_start], [t0_seek])
-    for c in (t0_source, t0_frame):
-        c.change(pick_preview, [t0_source, clip_state, t0_frame], [t0_preview])
 
-    # Frame scrubber mirrored into tabs 1/2/3 (visible only for an extracted clip),
-    # which also enables the Temporal analyze button. .release is user-only, so
-    # propagating a value to the other sliders never re-triggers them — no sync
-    # loop. run_chain reads the frame from t0_frame, so the t1/t2/t3 handlers push
-    # their value there first, then re-run the chain.
-    t0_source.change(frame_controls, [t0_source, clip_state],
-                     [t1_frame, t2_frame, t3_frame, temporal_btn, onnx_run_btn])
+    upload_outs = [still_state, clip_state, video_state, t0_info, t0_seekimg, t0_preview,
+                   t0_seek, t0_secs, t0_full, t0_extract, t1_frame, t2_frame, t3_frame,
+                   temporal_btn, onnx_run_btn]
+    t0_upload.change(on_upload, [t0_upload], upload_outs).then(run_chain, ins, outs)
+    t0_seek.release(seek_preview, [video_state, t0_seek], [t0_seekimg])
+    t0_extract.click(extract_clip, [video_state, t0_seek, t0_secs, t0_full],
+                     [still_state, clip_state, t0_info, t0_preview, t0_frame,
+                      t1_frame, t2_frame, t3_frame, temporal_btn, onnx_run_btn, fps_state]) \
+              .then(run_chain, ins, outs)
+    t0_frame.change(pick_preview, [still_state, clip_state, t0_frame], [t0_preview])
+
+    # Frame scrubber mirrored into tabs 1/2/3. .release is user-only, so propagating a
+    # value never re-triggers — no sync loop. run_chain reads the frame from t0_frame.
     t0_frame.release(mirror_frame, [t0_frame], [t1_frame, t2_frame, t3_frame])
     t1_frame.release(mirror_frame, [t1_frame], [t0_frame, t2_frame, t3_frame]).then(run_chain, ins, outs)
     t2_frame.release(mirror_frame, [t2_frame], [t0_frame, t1_frame, t3_frame]).then(run_chain, ins, outs)
@@ -509,10 +573,18 @@ with gr.Blocks(title="Defringe tuner") as demo:
     temporal_btn.click(temporal_analyze, ins,
                        [temporal_map, temporal_plot, temporal_stats, temporal_gallery])
     onnx_export_btn.click(export_onnx, ins, onnx_export_stat)
-    onnx_run_btn.click(run_onnx_clip, [t0_source, clip_state], [onnx_video, onnx_run_stat])
-    demo.load(seek_preview, [t0_start], [t0_seek])
+    onnx_run_btn.click(run_onnx_clip, [clip_state, fps_state], [onnx_video, onnx_run_stat])
+
+    # Seed the reset blob with the constructed values so reset is correct from first
+    # load; on save, refresh window.__defaults so reset retargets without a restart.
+    reg_comps = [c["comp"] for c in REG]
+    defaults_blob.value = json.dumps({f"def_{c['persist']}": c["comp"].value for c in REG})
+    save_def_btn.click(save_defaults, reg_comps, [defaults_blob, save_def_stat]) \
+                .then(None, defaults_blob, None, js="(b) => { window.__defaults = JSON.parse(b || '{}'); }")
+    restart_btn.click(restart_app)
     demo.load(run_chain, ins, outs)
     demo.load(None, None, None, js=TOOLTIP_JS)   # hints -> native hover tooltips
+    demo.load(None, None, None, js=RESET_JS)     # per-slider reset -> saved defaults
 
 if __name__ == "__main__":
     demo.launch(server_name="127.0.0.1", server_port=7862, show_error=True)

@@ -5,10 +5,12 @@
 *.log
 # scratch / deprecated code
 trash/
+# per-user "save settings as default" overrides (written at runtime by app.py)
+user_defaults.json
 
-# Video media (the source/*.mp4 is a symlink to a file outside the repo, and any
-# clips written by delivery/defringe_video.py are large build outputs). Keep the
-# small still test fixtures (source/*.webp, *.png) tracked.
+# Video media (source/*.mp4 is a symlink to a file outside the repo, and render
+# outputs like onnx_preview.mp4 are large build artefacts). Keep the small still
+# test fixtures (source/*.webp, *.png) tracked.
 *.mp4
 *.mkv
 *.mov
@@ -43,6 +45,7 @@ ENV/
 .coverage
 htmlcov/
 .ipynb_checkpoints/
+.claude/
 
 # --- OS / editor ---
 .DS_Store

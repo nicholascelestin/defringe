@@ -2,7 +2,7 @@
 name = "defringe"
 version = "0.1.0"
 description = "Green- and purple-fringe removal for video/stills (CIELAB, chroma-only)."
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 
 # Pinned (==) to the exact versions in the known-working .venv, so `uv sync`
 # reproduces this state rather than re-resolving to newer releases.
@@ -13,24 +13,27 @@ dependencies = [
     "pillow==12.2.0",
     "gradio==6.17.3",
     "matplotlib==3.10.9",
+    # ONNX export/run — torch is heavy but folded in so the app works in one step
+    "torch==2.12.0",
+    "onnx==1.21.0",
+    "onnxruntime==1.26.0",
+    "onnxscript==0.7.0",
 ]
 
 [project.optional-dependencies]
-export = [
-    "onnx>=1.21.0",
-    "onnxruntime>=1.26.0",
-    "onnxscript>=0.7.0",
-    "torch>=2.12.0",
-]
+test = ["pytest>=8.0"]
 
 # System dependency (not pip): ffmpeg / ffprobe must be on PATH — video_io.py
 # shells out to them for decode/encode.
 #
-# The `export` extra (torch/onnx/onnxruntime) is only needed to build/run the
-# ONNX port of the pipeline:  uv sync --extra export
+# The conformance suite (tests/) adds the `test` extra:  uv sync --extra test
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.uv]
-# This is an application with a flat module layout (algorithm/, app.py,
+# This is an application with a flat module layout (defringe_algorithm.py, app.py,
 # video_io.py at the root), not an installable package — manage deps only,
 # don't try to build/install the project itself.
 package = false
