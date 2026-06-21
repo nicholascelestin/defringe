@@ -1,16 +1,14 @@
-"""Torch/ONNX port of the canonical green_cast -> purple_cast pipeline.
+"""Torch/ONNX port of the green_cast -> purple_cast pipeline.
 
-Option A: a SEPARATE, ONNX-able approximation of the numpy algorithm in
-`defringe_algorithm.py` (which is left untouched). Two ops have no ONNX equivalent and are
-approximated; the per-caster area weighting is dropped:
+Since the scale-space rewrite, defringe_algorithm.py uses the SAME geometry as this port
+-- a box-sum count for Minimum Area and a square dilation + gaussian feather for Cast
+Reach -- so the two now closely converge (no more label()/distance_transform_edt gap).
 
-  scipy.ndimage.label (Minimum Area)        -> morphological opening (erode/dilate)
-  distance_transform_edt (Cast Reach)       -> dilate-by-reach + gaussian feather
-  caster_w (per-blob area weight)           -> dropped (all kept casters equal)
-
-Validated at ~0.1 mean ΔRGB vs the numpy pipeline (p99 <= 2 levels). Both passes
-become fully convolutional: rgb<->lab, threshold, max_pool (morphology), separable
-gaussian, pointwise. Params are baked from the canonical defaults at construction.
+Spatial params are resolution-relative; ONNX bakes kernel sizes as graph constants, so they
+are converted to px for a reference resolution at construction (ref_hw, default 1080p) --
+re-instantiate with ref_hw=frame.shape[:2] to bake another size. Both passes are fully
+convolutional: rgb<->lab, threshold, avg_pool (area), max_pool (reach), separable gaussian,
+pointwise.
 
   forward(rgb): (N,H,W,3) uint8 -> (N,H,W,3) uint8   (norm/transpose baked in)
 """
@@ -42,17 +40,26 @@ def _gauss1d(sigma, truncate=4.0):
 class Defringe(nn.Module):
     """green_cast -> purple_cast, ONNX-able. uint8 NHWC in/out."""
 
-    def __init__(self, green=None, purple=None):
+    def __init__(self, green=None, purple=None, ref_hw=(1080, 1920)):
         super().__init__()
-        self.g = {**GREEN_CAST, **(green or {})}
-        self.p = {**PURPLE_CAST, **(purple or {})}
+        # Spatial params arrive resolution-relative (see defringe_algorithm.cast_defringe);
+        # convert to px for a reference resolution since ONNX kernel sizes are constants.
+        _H, _W = ref_hw; _diag = (_W * _W + _H * _H) ** 0.5; _area = float(_H * _W)
+        def _to_px(P):
+            P = dict(P)
+            for k in ("cast_radius", "feather", "repair_spread", "tone_correction_radius"):
+                P[k] = P[k] * _diag / 1000.0           # per-mille of diagonal -> px
+            P["min_area"] = P["min_area"] * _area / 1e6  # ppm of area -> px^2
+            return P
+        self.g = _to_px({**GREEN_CAST, **(green or {})})
+        self.p = _to_px({**PURPLE_CAST, **(purple or {})})
         self.register_buffer("xyz_from_rgb", torch.tensor(_XYZ_FROM_RGB, dtype=torch.float32))
         self.register_buffer("rgb_from_xyz", torch.tensor(_RGB_FROM_XYZ, dtype=torch.float32))
         self.register_buffer("ref_white", torch.tensor(_REF_WHITE, dtype=torch.float32))
         for tag, P in (("g", self.g), ("p", self.p)):
             for nm, sig in (("feather", P["feather"]),
                             ("tone", P["tone_correction_radius"]),
-                            ("reach", max(P["radius_softness"] * P["cast_radius"], 1e-3))):
+                            ("reach", max(P["radius_softness"] * P["cast_radius"] * 0.4, 1e-3))):
                 k, r = _gauss1d(sig)
                 self.register_buffer(f"k_{tag}_{nm}", k)
                 setattr(self, f"r_{tag}_{nm}", r)
@@ -112,13 +119,14 @@ class Defringe(nn.Module):
             co = caster * (t * t * (3.0 - 2.0 * t))                          # ~ Minimum Area
         else:
             co = caster * (dens >= ma).float()
-        R = int(P["cast_radius"])
+        R = max(1, int(round(P["cast_radius"] * 0.8)))                       # 0.8: match numpy reach calib
         reach = self._sep(self._dilate(co, 2 * R + 1),                       # ~ Cast Reach
                           getattr(self, f"k_{tag}_reach"), getattr(self, f"r_{tag}_reach")).clamp(0, 1)
         keepS = shadow * reach * (1.0 - co)
         abase = keepS * strength.clamp(0, 1)
-        if P["repair_spread"] > 0:
-            abase = self._dilate(abase, int(2 * P["repair_spread"] + 1))
+        sp = int(round(P["repair_spread"]))
+        if sp > 0:
+            abase = self._dilate(abase, 2 * sp + 1)
         alpha = self._sep(abase, getattr(self, f"k_{tag}_feather"),
                           getattr(self, f"r_{tag}_feather")).clamp(0, P["max_opacity"])
         # directional repair (cf. numpy `donor`): down-weight tone donors on the

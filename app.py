@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 import gradio as gr
 import matplotlib
 matplotlib.use("Agg")               # headless: render plots to arrays, no display
@@ -42,14 +43,31 @@ def _overlay(rgb, alpha, thr=0.02):
     return np.where((alpha > thr)[..., None], 0.2 * rgb + 0.8 * over, rgb).astype(np.uint8)
 
 
-def detect_view(base, info, caster_color):
-    """Tint casters and corrected pixels over a dimmed frame (the detect image)."""
+def _draw_reach(img, caster, reach):
+    """White contour at `reach` px from the casters — the region searched for fringe."""
+    if not caster.any():
+        return
+    reach = max(1, int(round(reach)))
+    dist = distance_transform_edt(~caster)
+    img[(dist >= reach - 0.5) & (dist <= reach + 0.5)] = (255, 255, 255)
+
+
+def detect_view(base, info, caster_color, reach):
+    """Detect image over a dimmed frame: accepted casters bright, the ones min_area
+    rejected faint, fringe green, and a white ring at the cast reach around casters."""
     dm = 0.45 * base
-    if info["caster"].any():
-        dm[info["caster"]] = 0.5 * dm[info["caster"]] + 0.5 * np.array(caster_color)
+    caster, raw = info["caster"], info["caster_raw"]
+    rejected = raw & ~caster
+    if rejected.any():
+        dm[rejected] = 0.78 * dm[rejected] + 0.22 * np.array(caster_color)   # too small for min_area
+    if caster.any():
+        dm[caster] = 0.5 * dm[caster] + 0.5 * np.array(caster_color)
     lit = info["alpha"] > 0.05
     dm[lit] = 0.18 * dm[lit] + 0.82 * np.array(FRINGE_GREEN)
-    return np.clip(dm, 0, 255).astype(np.uint8)
+    out = np.clip(dm, 0, 255).astype(np.uint8)
+    H, W = base.shape[:2]
+    _draw_reach(out, caster, reach * (W * W + H * H) ** 0.5 / 1000.0)   # reach is ‰ of diagonal -> px
+    return out
 
 
 def stat_line(name, info):
@@ -132,7 +150,7 @@ def run_chain(still, clip, idx, g_on, pc_on, *vals):
 
     if g_on:
         gout, ginfo = alg.green_cast(rgb, **green)
-        g_detect = [(detect_view(rgb, ginfo, CASTER_RED), "casters (red) + shadows (green)"),
+        g_detect = [(detect_view(rgb, ginfo, CASTER_RED, green["cast_radius"]), "casters & reach"),
                     (_overlay(rgb, ginfo["alpha"]), "alpha")]
         g_stat = stat_line("green", ginfo)
     else:
@@ -141,7 +159,7 @@ def run_chain(still, clip, idx, g_on, pc_on, *vals):
 
     if pc_on:
         pcout, pcinfo = alg.purple_cast(gout, **purple)
-        pc_detect = [(detect_view(gout, pcinfo, CASTER_GOLD), "casters (gold) + fringe (green)"),
+        pc_detect = [(detect_view(gout, pcinfo, CASTER_GOLD, purple["cast_radius"]), "casters & reach"),
                      (_overlay(gout, pcinfo["alpha"]), "alpha")]
         pc_stat = stat_line("purple", pcinfo)
     else:
@@ -312,8 +330,12 @@ def export_onnx(still, clip, idx, g_on, pc_on, *vals, progress=gr.Progress()):
         green["max_opacity"] = 0.0
     if not pc_on:
         purple["max_opacity"] = 0.0
-    progress(0.3, desc="building model from current settings...")
-    model = Defringe(green=green, purple=purple).eval()
+    # Geometry is resolution-relative; bake the ONNX kernels for the frame you're tuning on
+    # (falls back to 1080p). Re-export at the deployment resolution for best geometry there.
+    frame = current_frame(still, clip, idx)
+    ref_hw = tuple(np.asarray(frame).shape[:2]) if frame is not None else (1080, 1920)
+    progress(0.3, desc=f"building model for {ref_hw[1]}x{ref_hw[0]}...")
+    model = Defringe(green=green, purple=purple, ref_hw=ref_hw).eval()
     dummy = torch.zeros(1, 540, 960, 3, dtype=torch.uint8)
     progress(0.55, desc="exporting ONNX (opset 17)...")
     torch.onnx.export(model, dummy, ONNX_PATH, opset_version=17,
@@ -324,7 +346,8 @@ def export_onnx(still, clip, idx, g_on, pc_on, *vals, progress=gr.Progress()):
     mb = os.path.getsize(ONNX_PATH) / 1e6
     off = ("" if g_on else " · green OFF") + ("" if pc_on else " · purple OFF")
     return (f"✅ Exported **{ONNX_PATH}** ({mb:.2f} MB) from the current slider settings{off}. "
-            f"Dynamic N/H/W, uint8 in/out. (~0.1 mean ΔRGB vs the exact numpy.)")
+            f"Geometry baked for {ref_hw[1]}×{ref_hw[0]} (re-export at the deployment "
+            f"resolution for best results); dynamic N/H/W, uint8 in/out.")
 
 
 def run_onnx_clip(clip, fps, progress=gr.Progress()):
@@ -377,6 +400,7 @@ RESET_JS = """
       if (!btn) return;
       const block = btn.closest('[id^="def_"]');
       if (!block) return;
+      seed();                                      // re-read blob: load-time seed can race empty
       const d = (window.__defaults || {})[block.id];
       if (d === undefined) return;                 // unknown -> let native reset run
       e.preventDefault(); e.stopImmediatePropagation();
@@ -412,6 +436,62 @@ TOOLTIP_JS = """
 }
 """
 
+WHEEL_JS = Path(__file__).with_name("defringe_wheel.js").read_text()
+
+
+def acc_head(title, target):
+    """Header for a custom CSS collapsible whose body is `#target` (a `.acc-body` column).
+    Unlike gr.Accordion it never unmounts its body, so wheel-bound sliders stay readable.
+    Styled (ACC_CSS) to match gr.Accordion's header exactly."""
+    return gr.HTML(f'<div class="acc-head" data-target="{target}">'
+                   f'<span>{title}</span><span class="chev">▼</span></div>')
+
+
+# Toggle a custom collapsible: flip `.open` on the body and its header (delegated, so it
+# works for panels that mount later on tab switch). CSS in ACC_CSS hides bodies by default.
+ACCORDION_JS = """
+() => {
+  if (window.__accWired) return;
+  window.__accWired = true;
+  document.addEventListener('click', (e) => {
+    const h = e.target.closest('.acc-head');
+    if (!h) return;
+    const body = document.getElementById(h.getAttribute('data-target'));
+    if (!body) return;
+    h.classList.toggle('open', body.classList.toggle('open'));
+  });
+}
+"""
+
+ACC_CSS = """
+/* .gacc mimics a gr.Accordion .block; .acc-head mimics its .label-wrap button. */
+.gacc{border:1px solid var(--border-color-primary);border-radius:var(--block-radius);
+  background:var(--block-background-fill);padding:var(--block-padding);gap:var(--spacing-lg,8px);}
+.gacc .prose{margin:0;}
+.gacc > div.block{padding:0;border:0;background:none;}   /* header gr.HTML's block: no pad, no 3px focus-border... */
+.gacc .html-container{padding:0;}                         /* ...and its inner container adds no padding */
+.acc-head{display:flex;justify-content:space-between;align-items:center;width:100%;
+  cursor:pointer;user-select:none;color:var(--body-text-color);
+  font-size:var(--block-title-text-size,14px);font-weight:var(--block-title-text-weight,400);}
+.acc-head .chev{font-size:14px;transition:transform .15s ease;transform:rotate(90deg);}
+.acc-head.open .chev{transform:rotate(0deg);}
+.acc-body{display:none;}
+.acc-body.open{display:block;}
+.hidden-blob{display:none !important;}   /* mounted (so RESET_JS can read it) but invisible */
+"""
+
+
+def green_wheel_config():
+    """Build the wheel's data-config from GREEN_REG (call after the sliders exist)."""
+    gid = {e["key"]: f"def_{e['persist']}" for e in GREEN_REG}
+    return json.dumps({"maxChroma": 60, "wedges": [
+        {"ref": alg.RED_REF, "color": "#c0392b",
+         "chroma": gid["caster_min_chroma"], "lo": gid["caster_hue_lo"], "hi": gid["caster_hue_hi"]},
+        {"ref": alg.GREEN_REF, "color": "#148f77",
+         "chroma": gid["fringe_min_chroma"], "lo": gid["fringe_hue_lo"], "hi": gid["fringe_hue_hi"]},
+    ]})
+
+
 with gr.Blocks(title="Defringe tuner") as demo:
     with gr.Row():
         with gr.Column(scale=1):
@@ -422,7 +502,9 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 save_def_btn = gr.Button("💾 Save settings", size="sm")
                 restart_btn = gr.Button("↻ Restart app", size="sm")
             save_def_stat = gr.Markdown("")
-    defaults_blob = gr.Textbox(visible=False, elem_id="defaults_blob")
+    # CSS-hidden, NOT visible=False: Gradio 6 unmounts invisible components, and RESET_JS
+    # (+ the wheel's reset) seed window.__defaults by reading this element from the DOM.
+    defaults_blob = gr.Textbox(elem_id="defaults_blob", elem_classes="hidden-blob")
     clip_state = gr.State(None)     # extracted video clip (frames)
     still_state = gr.State(None)    # uploaded image (when the source is a still)
     video_state = gr.State(None)    # uploaded video path (for seek/extract)
@@ -449,25 +531,37 @@ with gr.Blocks(title="Defringe tuner") as demo:
         with gr.Row():
             with gr.Column(scale=1):
                 g_on = gr.Checkbox(True, label="Enable", info="Turn the green pass on/off (off = passes straight to the purple tab).")
-                gr.Markdown("**Casters (warm)**")
-                S(GREEN_REG, "caster_min_chroma", 0, 30, 0.5, "Minimum Chroma", "How saturated a warm source must be to count as a fringe-caster. Lower = more casters.")
-                S(GREEN_REG, "caster_hue_lo", -90, 0, 1, "Hue Floor", "Low edge of the caster hue range; lower reaches toward purple.")
-                S(GREEN_REG, "caster_hue_hi", 0, 90, 1, "Hue Ceiling", "High edge of the caster hue range; higher reaches toward orange.")
-                S(GREEN_REG, "min_area", 0, 300, 1, "Minimum Area", "Ignore caster blobs smaller than this (px) to reject noise.")
-                S(GREEN_REG, "cast_radius", 2, 60, 1, "Cast Reach", "How far from a caster (px) to look for its green fringe.")
-                gr.Markdown("**Shadows (cool)**")
-                S(GREEN_REG, "fringe_min_chroma", 0, 15, 0.1, "Minimum Chroma", "How saturated a pixel must be to count as green fringe. Lower = catch fainter fringe.")
-                S(GREEN_REG, "fringe_hue_lo", -140, 0, 1, "Hue Floor", "Low edge of the green-fringe hue range; lower reaches toward green/yellow.")
-                S(GREEN_REG, "fringe_hue_hi", 0, 140, 1, "Hue Ceiling", "High edge of the green-fringe hue range; higher reaches toward blue/violet.")
+                green_wheel = gr.HTML("<div class='defringe-wheel-mount'></div>")
+                gr.Markdown("<div style='text-align:center'><sub>adjustable colour wheel for defining casters "
+                            "and shadows (fringe) with hue range and chroma strength.</sub></div>")
+                # Caster/shadow hue+chroma are driven by the wheel above, which reads & writes
+                # these sliders' DOM inputs — so they must stay mounted. A gr.Accordion unmounts
+                # its body when closed (blanking the wheel), so these use a custom CSS collapsible
+                # (acc_head + acc-body): collapsing just sets display:none, keeping them in the DOM.
+                with gr.Column(elem_classes="gacc"):
+                    acc_head("Casters (warm)", "acc-g-casters")
+                    with gr.Column(elem_id="acc-g-casters", elem_classes="acc-body"):
+                        S(GREEN_REG, "caster_min_chroma", 0, 30, 0.5, "Minimum Chroma", "How saturated a warm source must be to count as a fringe-caster. Lower = more casters.")
+                        S(GREEN_REG, "caster_hue_lo", -90, 0, 1, "Hue Floor", "Low edge of the caster hue range; lower reaches toward purple.")
+                        S(GREEN_REG, "caster_hue_hi", 0, 90, 1, "Hue Ceiling", "High edge of the caster hue range; higher reaches toward orange.")
+                with gr.Column(elem_classes="gacc"):
+                    acc_head("Shadows (cool)", "acc-g-shadows")
+                    with gr.Column(elem_id="acc-g-shadows", elem_classes="acc-body"):
+                        S(GREEN_REG, "fringe_min_chroma", 0, 15, 0.1, "Minimum Chroma", "How saturated a pixel must be to count as green fringe. Lower = catch fainter fringe.")
+                        S(GREEN_REG, "fringe_hue_lo", -140, 0, 1, "Hue Floor", "Low edge of the green-fringe hue range; lower reaches toward green/yellow.")
+                        S(GREEN_REG, "fringe_hue_hi", 0, 140, 1, "Hue Ceiling", "High edge of the green-fringe hue range; higher reaches toward blue/violet.")
+                with gr.Accordion("Size & Reach", open=True):   # not wheel-bound -> plain accordion is fine
+                    S(GREEN_REG, "min_area", 0, 100, 0.5, "Minimum Area", "Ignore caster blobs smaller than this — ppm of frame area (resolution-independent).")
+                    S(GREEN_REG, "cast_radius", 0, 15, 0.1, "Cast Reach", "How far from a caster to look for its green fringe — ‰ of the frame diagonal.")
                 gr.Markdown("**Repair**")
                 S(GREEN_REG, "max_opacity", 0, 1, 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive.")
-                S(GREEN_REG, "repair_spread", 0, 20, 1, "Repair Spread", "Grow the corrected region outward by this many px before feathering.")
-                S(GREEN_REG, "feather", 0, 5, 0.1, "Feather", "Soften/blur the correction's edge (px).")
+                S(GREEN_REG, "repair_spread", 0, 5, 0.05, "Repair Spread", "Grow the corrected region outward before feathering — ‰ of the frame diagonal.")
+                S(GREEN_REG, "feather", 0, 5, 0.05, "Feather", "Soften/blur the correction's edge — ‰ of the frame diagonal.")
                 with gr.Accordion("Advanced", open=False):
                     S(GREEN_REG, "area_softness", 0, 1, 0.05, "Area Softness", "Fade marginal-size casters in/out instead of popping — for temporal stability. 0 = hard cutoff.")
                     S(GREEN_REG, "radius_softness", 0, 1, 0.05, "Reach Softness", "Fade the fringe out with distance instead of a hard edge — for temporal stability. 0 = hard cutoff.")
                     S(GREEN_REG, "full_strength_span", 1, 30, 0.5, "Full-Strength Span", "Extra chroma above Minimum Chroma that reaches full correction. Wider = gentler.")
-                    S(GREEN_REG, "tone_correction_radius", 5, 50, 1, "Tone Correction Radius", "How far out (px) to sample the clean colour fringe is pulled toward.")
+                    S(GREEN_REG, "tone_correction_radius", 0, 25, 0.1, "Tone Correction Radius", "How far out to sample the clean colour fringe is pulled toward — ‰ of the frame diagonal.")
                     S(GREEN_REG, "tone_directionality", 0, 1, 0.05, "Tone Directionality", "Pull repair colour from the cast side, not the caster. 0 = all directions, 1 = away from caster.")
             with gr.Column(scale=2):
                 t1_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", visible=False)
@@ -485,8 +579,8 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 pc_on = gr.Checkbox(True, label="Enable", info="Turn the purple pass on/off (runs after the green pass).")
                 gr.Markdown("**Casters (bright)**")
                 S(PURPLE_REG, "caster_min_lightness", 50, 100, 1, "Minimum Lightness", "How bright a highlight must be to count as a fringe-caster.")
-                S(PURPLE_REG, "min_area", 0, 300, 1, "Minimum Area", "Ignore highlight blobs smaller than this (px).")
-                S(PURPLE_REG, "cast_radius", 2, 60, 1, "Cast Reach", "How far from a highlight (px) to look for its magenta fringe.")
+                S(PURPLE_REG, "min_area", 0, 150, 0.5, "Minimum Area", "Ignore highlight blobs smaller than this — ppm of frame area (resolution-independent).")
+                S(PURPLE_REG, "cast_radius", 0, 30, 0.1, "Cast Reach", "How far from a highlight to look for its magenta fringe — ‰ of the frame diagonal.")
                 gr.Markdown("**Shadows (magenta)** — detected as a magenta *excess* over the scene's overall lighting tone")
                 S(PURPLE_REG, "fringe_min_chroma", 0, 15, 0.1, "Minimum Chroma", "Chroma floor — pixels below this are never flagged (noise rejection).")
                 S(PURPLE_REG, "target_hue", -45, 45, 1, "Target Hue", "Shift the detected fringe colour: 0 = magenta, higher = toward red, lower = toward violet/blue.")
@@ -494,14 +588,14 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 S(PURPLE_REG, "hue_halfwidth", 5, 90, 1, "Hue Range (±°)", "How wide a band of hues around Target Hue counts as fringe. 90 = essentially no limit; lower narrows it to colours nearer the target.")
                 gr.Markdown("**Repair**")
                 S(PURPLE_REG, "max_opacity", 0, 1, 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive.")
-                S(PURPLE_REG, "repair_spread", 0, 20, 1, "Repair Spread", "Grow the corrected region outward by this many px before feathering.")
-                S(PURPLE_REG, "feather", 0, 5, 0.1, "Feather", "Soften/blur the correction's edge (px).")
+                S(PURPLE_REG, "repair_spread", 0, 5, 0.05, "Repair Spread", "Grow the corrected region outward before feathering — ‰ of the frame diagonal.")
+                S(PURPLE_REG, "feather", 0, 5, 0.05, "Feather", "Soften/blur the correction's edge — ‰ of the frame diagonal.")
                 with gr.Accordion("Advanced", open=False):
                     S(PURPLE_REG, "area_softness", 0, 1, 0.05, "Area Softness", "Fade marginal highlights in/out instead of popping — for temporal stability. 0 = hard cutoff.")
                     S(PURPLE_REG, "radius_softness", 0, 1, 0.05, "Reach Softness", "Fade the fringe out with distance instead of a hard edge — for temporal stability. 0 = hard cutoff.")
                     S(PURPLE_REG, "hue_softness", 0, 45, 1, "Hue Range Softness", "Feather (°) on the Hue Range edge — ramp the cutoff instead of a hard boundary, for temporal stability. 0 = hard edge.")
                     S(PURPLE_REG, "full_strength_span", 1, 30, 0.5, "Full-Strength Span", "Extra excess above the threshold that reaches full correction. Wider = gentler.")
-                    S(PURPLE_REG, "tone_correction_radius", 5, 50, 1, "Tone Correction Radius", "How far out (px) to sample the clean colour fringe is pulled toward.")
+                    S(PURPLE_REG, "tone_correction_radius", 0, 25, 0.1, "Tone Correction Radius", "How far out to sample the clean colour fringe is pulled toward — ‰ of the frame diagonal.")
                     S(PURPLE_REG, "tone_directionality", 0, 1, 0.05, "Tone Directionality", "Pull repair colour from the fringe side, not the highlight. 0 = all directions, 1 = away from highlight.")
             with gr.Column(scale=2):
                 t2_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", visible=False)
@@ -536,6 +630,9 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 onnx_run_stat = gr.Markdown("Extract a clip (Tab 0), Export, then Run.")
             with gr.Column(scale=2):
                 onnx_video = gr.Video(label="ONNX output — whole clip", height=420)
+
+    # GREEN_REG is fully built now, so the wheel's slider element IDs resolve.
+    green_wheel.value = f"<div class='defringe-wheel-mount' data-config='{green_wheel_config()}'></div>"
 
     ins = [still_state, clip_state, t0_frame, g_on, pc_on,
            *[e["comp"] for e in GREEN_REG], *[e["comp"] for e in PURPLE_REG]]
@@ -577,6 +674,8 @@ with gr.Blocks(title="Defringe tuner") as demo:
     demo.load(run_chain, ins, outs)
     demo.load(None, None, None, js=TOOLTIP_JS)   # hints -> native hover tooltips
     demo.load(None, None, None, js=RESET_JS)     # per-slider reset -> saved defaults
+    demo.load(None, None, None, js=ACCORDION_JS) # custom collapsibles (wheel-safe)
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7862, show_error=True)
+    demo.launch(server_name="127.0.0.1", server_port=7862, show_error=True, css=ACC_CSS,
+                head=f"<script>{WHEEL_JS}</script>")

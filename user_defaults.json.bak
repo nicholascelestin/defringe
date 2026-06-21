@@ -1,0 +1,130 @@
+{
+  "s0": {
+    "label": "Minimum Chroma",
+    "value": 21
+  },
+  "s1": {
+    "label": "Hue Floor",
+    "value": -54
+  },
+  "s2": {
+    "label": "Hue Ceiling",
+    "value": 23
+  },
+  "s3": {
+    "label": "Minimum Chroma",
+    "value": 4.5
+  },
+  "s4": {
+    "label": "Hue Floor",
+    "value": -80
+  },
+  "s5": {
+    "label": "Hue Ceiling",
+    "value": 90
+  },
+  "s6": {
+    "label": "Minimum Area",
+    "value": 19
+  },
+  "s7": {
+    "label": "Cast Reach",
+    "value": 9
+  },
+  "s8": {
+    "label": "Maximum Strength",
+    "value": 0.7
+  },
+  "s9": {
+    "label": "Repair Spread",
+    "value": 1
+  },
+  "s10": {
+    "label": "Feather",
+    "value": 2
+  },
+  "s11": {
+    "label": "Area Softness",
+    "value": 0.4
+  },
+  "s12": {
+    "label": "Reach Softness",
+    "value": 0.4
+  },
+  "s13": {
+    "label": "Full-Strength Span",
+    "value": 9.5
+  },
+  "s14": {
+    "label": "Tone Correction Radius",
+    "value": 16
+  },
+  "s15": {
+    "label": "Tone Directionality",
+    "value": 0.5
+  },
+  "s16": {
+    "label": "Minimum Lightness",
+    "value": 88
+  },
+  "s17": {
+    "label": "Minimum Area",
+    "value": 10
+  },
+  "s18": {
+    "label": "Cast Reach",
+    "value": 16
+  },
+  "s19": {
+    "label": "Minimum Chroma",
+    "value": 6
+  },
+  "s20": {
+    "label": "Target Hue",
+    "value": 0
+  },
+  "s21": {
+    "label": "Excess Threshold",
+    "value": 7.5
+  },
+  "s22": {
+    "label": "Hue Range (\u00b1\u00b0)",
+    "value": 35
+  },
+  "s23": {
+    "label": "Maximum Strength",
+    "value": 1
+  },
+  "s24": {
+    "label": "Repair Spread",
+    "value": 5
+  },
+  "s25": {
+    "label": "Feather",
+    "value": 2
+  },
+  "s26": {
+    "label": "Area Softness",
+    "value": 0.4
+  },
+  "s27": {
+    "label": "Reach Softness",
+    "value": 0.4
+  },
+  "s28": {
+    "label": "Hue Range Softness",
+    "value": 10
+  },
+  "s29": {
+    "label": "Full-Strength Span",
+    "value": 10
+  },
+  "s30": {
+    "label": "Tone Correction Radius",
+    "value": 16
+  },
+  "s31": {
+    "label": "Tone Directionality",
+    "value": 0.7
+  }
+}

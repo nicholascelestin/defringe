@@ -1,9 +1,11 @@
 """Conformance: the torch/ONNX port must track the numpy reference within tolerance.
 
-defringe_algorithm.py is canonical; cast_torch.py is an ONNX-able approximation that
-swaps scipy's label/EDT for convolutions and drops per-caster area weighting. These
-tests pin that approximation to a measured tolerance so it cannot silently drift.
-Measured worst case is mean 0.07 / p99 1; the tolerances below leave headroom.
+defringe_algorithm.py is canonical; cast_torch.py is its ONNX-able twin. Since the
+scale-space rewrite both share the same geometry (box-sum count for Minimum Area, square
+dilation + gaussian feather for Cast Reach), so they converge tightly -- worst case ~mean
+0.06 / p99 1 / max 5 on the 1080p stills below. These tests pin that so it can't silently
+drift. Spatial params are resolution-relative; the port bakes them for ref_hw (default
+1080p), which matches these stills.
 """
 import numpy as np
 import pytest

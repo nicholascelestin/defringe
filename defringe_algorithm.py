@@ -7,8 +7,7 @@ end: cast_defringe). Chain green-first; purple fringe can itself cast green frin
 """
 import numpy as np
 from skimage.color import rgb2lab, lab2rgb
-from scipy.ndimage import (gaussian_filter, maximum_filter, label,
-                           distance_transform_edt)
+from scipy.ndimage import gaussian_filter, maximum_filter, uniform_filter
 
 __all__ = ["green_cast", "purple_cast", "cast_defringe",
            "GREEN_CAST", "PURPLE_CAST", "RED_REF", "GREEN_REF", "MAGENTA_REF"]
@@ -65,44 +64,58 @@ def local_tone(a, b, trust, sigma):
 # ── shared casting-shadow engine ─────────────────────────────────────────────
 
 def cast_defringe(src, lab, caster, fringe, strength, p):
-    """Shared back end: gate `fringe` by reach to the nearest `caster`, build a
-    feathered alpha from `strength`, pull chroma to the trusted local tone (L kept).
-    -> (uint8, {alpha, caster, shadow}); untouched pixels bit-exact."""
-    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    """Shared back end: gate `fringe` by reach to a nearby `caster`, build a feathered
+    alpha from `strength`, pull chroma to the trusted local tone (L kept).
+    -> (uint8, {alpha, caster, caster_raw, shadow}); untouched pixels bit-exact.
 
-    shadow_strength = np.zeros(L.shape, np.float32)
-    caster_mask = np.zeros(L.shape, bool)
+    Geometry is scale-space and resolution-relative: the spatial params arrive as
+    fractions of the frame and convert to px from the frame's own size, so a setting
+    transfers across resolutions. `min_area` is ppm of frame AREA; `cast_radius`,
+    `feather`, `repair_spread`, `tone_correction_radius` are per-mille of the DIAGONAL.
+    The area test is a box-sum count + soft threshold (not connected components) and the
+    reach is a square dilation + gaussian feather (not a Euclidean distance transform) --
+    both linear/local, so the ONNX port matches and resolution scaling is exact.
+    caster_raw is the raw detection; caster is what survived the area test."""
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    H, W = L.shape
+    diag = (W * W + H * H) ** 0.5
+    min_area = p["min_area"] * (H * W) / 1e6                     # ppm of area  -> px^2
+    reach = p["cast_radius"] * diag / 1000.0                    # per-mille of diagonal -> px
+    feather = p["feather"] * diag / 1000.0
+    spread = p["repair_spread"] * diag / 1000.0
+    tone_radius = p["tone_correction_radius"] * diag / 1000.0
+
+    cf = caster.astype(np.float32)
+    # Minimum Area as a local bright-pixel count (box-sum), soft-thresholded into a
+    # continuous per-pixel caster weight -- marginal-size casters ramp in, not pop.
+    wa = 2 * max(1, int(round(min_area ** 0.5))) + 1
+    count = uniform_filter(cf, wa) * float(wa * wa)
+    caster_w = cf * soft_step(count, min_area - 0.5, max(p["area_softness"], 1e-6) * min_area)
+    caster_mask = caster_w > 0.5
+
+    # Cast Reach as a square dilation of the kept-caster field (which carries the area
+    # weight) plus a gaussian feather; 0.8/0.4 calibrate the square footprint to the
+    # former Euclidean reach. reach_weight ~ 1 over caster + reach, decaying outward.
+    R = max(1, int(round(reach * 0.8)))
+    reach_weight = np.clip(gaussian_filter(maximum_filter(caster_w, size=2 * R + 1),
+                                           max(p["radius_softness"] * reach * 0.4, 1e-3)), 0, 1)
+    candidate = fringe & (reach_weight > 1e-3) & (~caster_mask)
+    shadow_strength = candidate.astype(np.float32) * reach_weight
     donor = np.ones(L.shape, np.float32)
-    labels, n_casters = label(caster)
-    if n_casters:
-        areas = np.bincount(labels.ravel()); areas[0] = 0
-        # -0.5 so a width=0 ramp reduces to a hard area >= min_area
-        large_caster = soft_step(areas.astype(np.float32), p["min_area"] - 0.5,
-                                 p["area_softness"] * p["min_area"])[labels] > 0
-        labels, n_casters = label(large_caster); areas = np.bincount(labels.ravel()); areas[0] = 0
-        caster_weight = soft_step(areas.astype(np.float32), p["min_area"] - 0.5,
-                                  p["area_softness"] * p["min_area"]); caster_weight[0] = 0.0
-        caster_mask = large_caster
-        dist_to_caster, (nearest_y, nearest_x) = distance_transform_edt(~large_caster, return_indices=True)
-        reach_softness = p["radius_softness"] * p["cast_radius"]
-        candidate = fringe & (dist_to_caster <= p["cast_radius"] + 2.0 * reach_softness) & ~large_caster
-        reach_weight = soft_step(-dist_to_caster, -(p["cast_radius"] + 1e-6), reach_softness)
-        shadow_strength = candidate.astype(np.float32) * caster_weight[labels[nearest_y, nearest_x]] * reach_weight
-        # donor -> 0 near the caster, so tone is pulled from the clean down-cast side
-        if p["tone_directionality"] > 0:
-            away_from_caster = soft_step(dist_to_caster, p["cast_radius"], p["cast_radius"])
-            donor = (1.0 - p["tone_directionality"] * (1.0 - away_from_caster)).astype(np.float32)
+    if p["tone_directionality"] > 0:                            # bias tone donors off the caster side
+        donor = (1.0 - p["tone_directionality"] * reach_weight).astype(np.float32)
 
     alpha_seed = shadow_strength * strength
-    if p["repair_spread"] > 0:
-        alpha_seed = maximum_filter(alpha_seed, size=int(2 * p["repair_spread"] + 1))
-    alpha = np.clip(gaussian_filter(alpha_seed, p["feather"]), 0, p["max_opacity"])
+    sp = int(round(spread))
+    if sp > 0:
+        alpha_seed = maximum_filter(alpha_seed, size=2 * sp + 1)
+    alpha = np.clip(gaussian_filter(alpha_seed, feather), 0, p["max_opacity"])
     # 1e-3 keeps faint trust everywhere so corrected regions still get a tone estimate
     trust = ((1 - alpha) + 1e-3) * donor
-    tone_a, tone_b = local_tone(a, b, trust, p["tone_correction_radius"])
+    tone_a, tone_b = local_tone(a, b, trust, tone_radius)
     out = lab_to_rgb(np.stack([L, a + alpha * (tone_a - a), b + alpha * (tone_b - b)], -1))
     out = composite(out, src, alpha)
-    return out, {"alpha": alpha, "caster": caster_mask, "shadow": shadow_strength > 0}
+    return out, {"alpha": alpha, "caster": caster_mask, "caster_raw": caster, "shadow": shadow_strength > 0}
 
 
 # ── green pass ───────────────────────────────────────────────────────────────
@@ -118,13 +131,16 @@ GREEN_CAST = dict(
     fringe_hue_lo=-80.0,
     fringe_hue_hi=90.0,
     fringe_min_chroma=4.5,
-    cast_radius=9,
-    min_area=19,
+    # Spatial knobs are resolution-relative (see cast_defringe): cast_radius/feather/
+    # repair_spread/tone_correction_radius are per-mille of the diagonal; min_area is
+    # ppm of frame area. Values below are the former 1080p pixel defaults, converted.
+    cast_radius=4.0,              # ‰ of diagonal
+    min_area=10.0,                # ppm of frame area
     full_strength_span=9.5,
     max_opacity=0.7,
-    repair_spread=1,
-    feather=2.0,
-    tone_correction_radius=16.0,
+    repair_spread=0.45,           # was 1 px
+    feather=0.91,                 # was 2 px
+    tone_correction_radius=7.26,  # was 16 px
     # *_softness: soft-step ramp width as a fraction of the matching threshold.
     area_softness=0.4,
     radius_softness=0.4,
@@ -156,13 +172,13 @@ MAGENTA_REF = 315.0   # magenta-violet; the fringe excess is measured along this
 PURPLE_CAST = dict(
     caster_min_lightness=88.0,
     fringe_min_chroma=6.8,
-    cast_radius=8,
-    min_area=10,
+    cast_radius=3.63,             # per-mille of diagonal (was 8 px @1080p); see cast_defringe
+    min_area=4.82,               # ppm of frame area      (was 10 px^2 @1080p)
     full_strength_span=10.0,
     max_opacity=0.85,
-    repair_spread=2,
-    feather=2.0,
-    tone_correction_radius=16.0,
+    repair_spread=0.91,          # was 2 px
+    feather=0.91,                # was 2 px
+    tone_correction_radius=7.26, # was 16 px
     # *_softness: soft-step ramp width as a fraction of the matching threshold.
     area_softness=0.4,
     radius_softness=0.4,
