@@ -416,11 +416,7 @@ with gr.Blocks(title="Defringe tuner") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("# Defringe tuner\n"
-                        "Remove green & purple colour fringing from stills and video — only chroma is "
-                        "touched, lightness stays put.\n\n"
-                        "**Flow:** pick a frame in **Source** → tune **Green**, then **Purple** "
-                        "(each toggleable) → check **Temporal** for flicker → **ONNX export** to ship. "
-                        "Hover any control for what it does.")
+                        "Removes green and purple fringe from videos, touching just the chroma channels.")
         with gr.Column(scale=0, min_width=300):
             with gr.Row():
                 save_def_btn = gr.Button("💾 Save settings", size="sm")
@@ -434,7 +430,7 @@ with gr.Blocks(title="Defringe tuner") as demo:
 
     with gr.Tab("0 · Source"):
         gr.Markdown("Upload an **image** to tune on directly, or a **video** to seek into and "
-                    "extract a clip. This feeds the Green and Purple tabs.")
+                    "extract a clip.")
         with gr.Row():
             with gr.Column(scale=1):
                 t0_upload = gr.File(file_types=["image", "video"], type="filepath", label="source — image or video")
