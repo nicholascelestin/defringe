@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""Defringe tuner — a tabbed Gradio app over defringe_algorithm.py.
+"""Defringe tuner — a tabbed Gradio app: layout + event wiring.
 
 Source: pick a still or extract a 10s video clip. Green / Purple: tune each pass
 (toggleable) live. Temporal: flicker stats over 6 frames. ONNX export: bake the
-current settings into a portable model. Every slider declares its algorithm key,
-so one registry drives the pipeline call, the persistence, and the live reset.
+current settings into a portable model.
 
-Run:  .venv/bin/python app.py
+The heavy lifting lives in siblings: defringe_numpy (the algorithm), params (the slider
+registry / persistence that drives the pipeline call, reset, and wheel), views (detection
+overlays + wheel config), video_io / onnx_runtime (I/O + device). This file is the
+controllers + the Blocks tree that glue them together.
+
+Run:  uv run python app.py
 """
 import os
 import sys
 import json
 import shutil
-import tempfile
-import subprocess
 from pathlib import Path
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt
 import gradio as gr
 import matplotlib
 matplotlib.use("Agg")               # headless: render plots to arrays, no display
@@ -25,55 +26,18 @@ import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 
 import video_io
-import defringe_algorithm as alg
+import onnx_runtime
+import views
+import defringe_numpy as alg
+from params import S, GREEN_REG, PURPLE_REG, REG, split, export_profile, import_profile
 
 DEFAULT_SECS = 10        # clip length to grab into memory, in seconds
 ONNX_PATH = "cast_defringe.onnx"            # exported model (green->purple cast)
 ONNX_PREVIEW = "onnx_preview.mp4"           # last ONNX-on-clip render (gitignored)
-G, PC = alg.GREEN_CAST, alg.PURPLE_CAST
 
 if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
     print("⚠ ffmpeg/ffprobe not on PATH — video upload needs them "
           "(brew install ffmpeg / apt install ffmpeg). Images still work.")
-
-CASTER_RED, CASTER_GOLD, FRINGE_GREEN = (230., 60., 50.), (255., 215., 0.), (0., 255., 120.)
-
-
-def _overlay(rgb, alpha, thr=0.02):
-    over = cm.turbo(np.clip(alpha, 0, 1))[..., :3] * 255
-    return np.where((alpha > thr)[..., None], 0.2 * rgb + 0.8 * over, rgb).astype(np.uint8)
-
-
-def _draw_reach(img, caster, reach):
-    """White contour at `reach` px from the casters — the region searched for fringe."""
-    if not caster.any():
-        return
-    reach = max(1, int(round(reach)))
-    dist = distance_transform_edt(~caster)
-    img[(dist >= reach - 0.5) & (dist <= reach + 0.5)] = (255, 255, 255)
-
-
-def detect_view(base, info, caster_color, reach):
-    """Detect image over a dimmed frame: accepted casters bright, the ones min_area
-    rejected faint, fringe green, and a white ring at the cast reach around casters."""
-    dm = 0.45 * base
-    caster, raw = info["caster"], info["caster_raw"]
-    rejected = raw & ~caster
-    if rejected.any():
-        dm[rejected] = 0.78 * dm[rejected] + 0.22 * np.array(caster_color)   # too small for min_area
-    if caster.any():
-        dm[caster] = 0.5 * dm[caster] + 0.5 * np.array(caster_color)
-    lit = info["alpha"] > 0.05
-    dm[lit] = 0.18 * dm[lit] + 0.82 * np.array(FRINGE_GREEN)
-    out = np.clip(dm, 0, 255).astype(np.uint8)
-    H, W = base.shape[:2]
-    _draw_reach(out, caster, reach * (W * W + H * H) ** 0.5 / 1000.0)   # reach is ‰ of diagonal -> px
-    return out
-
-
-def stat_line(name, info):
-    a = info["alpha"]
-    return f"{name} sel(a>0.1): {100 * np.mean(a > 0.1):.3f}%  a-max {a.max():.2f}"
 
 
 def current_frame(still, clip, idx):
@@ -85,88 +49,10 @@ def current_frame(still, clip, idx):
     return None
 
 
-# --- slider registry: each slider knows its algorithm key, so one map serves the
-# pipeline call, persistence (user_defaults.json, keyed s0.., label-guarded), and
-# the JS reset. REG is creation order (persistence); GREEN_REG/PURPLE_REG feed the
-# per-pass kwargs. ---
-DEFAULTS_FILE = Path(__file__).with_name("user_defaults.json")
-
-
-def _load_saved():
-    try:
-        return json.loads(DEFAULTS_FILE.read_text())   # {persist_key: {"label", "value"}}
-    except Exception:
-        return {}
-
-
-SAVED = _load_saved()
-REG, GREEN_REG, PURPLE_REG = [], [], []
-_sn = [0]
-
-
-def S(reg, key, lo, hi, step, label, info=None):
-    """Slider for algorithm param `key`, default seeded from the pass's defaults
-    then user_defaults.json; registered for the kwargs map, persistence, and reset."""
-    persist = f"s{_sn[0]}"; _sn[0] += 1
-    base = (G if reg is GREEN_REG else PC)[key]        # the pass's built-in default (profile fallback)
-    default = base
-    saved = SAVED.get(persist)
-    if saved and saved.get("label") == label:        # label guard: ignore stale keys
-        default = saved["value"]
-    comp = gr.Slider(lo, hi, value=default, step=step, label=label, info=info, elem_id=f"def_{persist}")
-    entry = {"persist": persist, "label": label, "key": key, "comp": comp, "base": base}
-    reg.append(entry); REG.append(entry)
-    return comp
-
-
-def build_params(reg, vals):
-    """Map a pass's slider values to its algorithm kwargs (registry order)."""
-    return {e["key"]: v for e, v in zip(reg, vals)}
-
-
 def restart_app():
     """Re-exec the process: a fresh server on the same port (also picks up code edits).
     The in-memory clip is lost; saved defaults persist on disk."""
     os.execv(sys.executable, [sys.executable, *sys.argv])
-
-
-def _profile_dict(vals):
-    return {c["persist"]: {"label": c["label"], "value": v} for c, v in zip(REG, vals)}
-
-
-def export_profile(*vals):
-    """Write the current settings to a JSON file the browser downloads. Does NOT touch the
-    active profile — it's just an export you keep on disk and re-import later."""
-    path = Path(tempfile.gettempdir()) / "defringe_profile.json"
-    path.write_text(json.dumps(_profile_dict(vals), indent=2))
-    return str(path)
-
-
-def import_profile(file):
-    """Load a profile JSON: apply it to every slider, copy it to DEFAULTS_FILE so it's the
-    active profile on the next app start, and hand RESET_JS a fresh {elem_id: value} map.
-    Outputs: one value per REG slider, then the reset blob, then a status line."""
-    blank = [gr.update()] * len(REG)
-    if not file:
-        return blank + ["{}", "no file selected"]
-    try:
-        raw = json.loads(Path(file).read_text())
-    except Exception as e:
-        return blank + ["{}", f"✗ couldn't read profile: {e}"]
-    DEFAULTS_FILE.write_text(json.dumps(raw, indent=2))   # becomes the active profile on next load
-    vals, applied = [], 0
-    for c in REG:
-        s = raw.get(c["persist"])
-        if isinstance(s, dict) and s.get("label") == c["label"]:
-            vals.append(s["value"]); applied += 1
-        else:
-            vals.append(c["base"])                        # not in the profile -> pass default
-    client = {f"def_{c['persist']}": v for c, v in zip(REG, vals)}
-    return vals + [json.dumps(client), f"✓ loaded {Path(file).name} ({applied} settings) — active profile"]
-
-
-def _split(vals):
-    return build_params(GREEN_REG, vals[:len(GREEN_REG)]), build_params(PURPLE_REG, vals[len(GREEN_REG):])
 
 
 def run_chain(still, clip, idx, g_on, pc_on, *vals):
@@ -174,22 +60,24 @@ def run_chain(still, clip, idx, g_on, pc_on, *vals):
     rgb = current_frame(still, clip, idx)
     if rgb is None:
         return None, None, "no frame", None, None, "no frame"
-    green, purple = _split(vals)
+    green, purple = split(vals)
 
     if g_on:
-        gout, ginfo = alg.green_cast(rgb, **green)
-        g_detect = [(detect_view(rgb, ginfo, CASTER_RED, green["cast_radius"]), "casters & reach"),
-                    (_overlay(rgb, ginfo["alpha"]), "alpha")]
-        g_stat = stat_line("green", ginfo)
+        gcast = alg.green_cast(rgb, **green)
+        gout = gcast.image
+        g_detect = [(views.detect_view(rgb, gcast, views.CASTER_RED, green["cast_radius"]), "casters & reach"),
+                    (views.overlay(rgb, gcast.alpha), "alpha")]
+        g_stat = views.stat_line("green", gcast)
     else:
         gout, g_stat = rgb, "green DISABLED (passthrough)"
         g_detect = [(rgb, "casters (red) + shadows (green)"), (rgb, "alpha")]
 
     if pc_on:
-        pcout, pcinfo = alg.purple_cast(gout, **purple)
-        pc_detect = [(detect_view(gout, pcinfo, CASTER_GOLD, purple["cast_radius"]), "casters & reach"),
-                     (_overlay(gout, pcinfo["alpha"]), "alpha")]
-        pc_stat = stat_line("purple", pcinfo)
+        pcast = alg.purple_cast(gout, **purple)
+        pcout = pcast.image
+        pc_detect = [(views.detect_view(gout, pcast, views.CASTER_GOLD, purple["cast_radius"]), "casters & reach"),
+                     (views.overlay(gout, pcast.alpha), "alpha")]
+        pc_stat = views.stat_line("purple", pcast)
     else:
         pcout, pc_stat = gout, "purple DISABLED (passthrough)"
         pc_detect = [(gout, "casters (gold) + fringe (green)"), (gout, "alpha")]
@@ -303,15 +191,15 @@ def temporal_analyze(still, clip, idx, g_on, pc_on, *vals):
     if n < 2:
         return None, None, (f"Frame {i0} is too close to the clip end "
                             f"({n} frame(s)); pick an earlier start frame."), None
-    green, purple = _split(vals)
+    green, purple = split(vals)
     src, greens, finals, ga, pa = [], [], [], [], []
     for fr in sel:
         if g_on:
-            gout, ginfo = alg.green_cast(fr, **green); galpha = ginfo["alpha"]
+            gcast = alg.green_cast(fr, **green); gout, galpha = gcast.image, gcast.alpha
         else:
             gout, galpha = fr, np.zeros(fr.shape[:2], np.float32)
         if pc_on:
-            pout, pinfo = alg.purple_cast(gout, **purple); palpha = pinfo["alpha"]
+            pcast = alg.purple_cast(gout, **purple); pout, palpha = pcast.image, pcast.alpha
         else:
             pout, palpha = gout, np.zeros(np.asarray(gout).shape[:2], np.float32)
         src.append(np.asarray(fr, np.float32)); greens.append(np.asarray(gout, np.float32))
@@ -351,10 +239,10 @@ def export_onnx(still, clip, idx, g_on, pc_on, *vals, progress=gr.Progress()):
     progress(0.05, desc="loading torch...")
     try:
         import torch
-        from cast_torch import Defringe
+        from defringe_torch import Defringe
     except Exception as e:
         return f"⚠️ torch not available — try `uv sync` to reinstall deps.\n\n`{e}`"
-    green, purple = _split(vals)
+    green, purple = split(vals)
     if not g_on:
         green["max_opacity"] = 0.0
     if not pc_on:
@@ -380,67 +268,14 @@ def export_onnx(still, clip, idx, g_on, pc_on, *vals, progress=gr.Progress()):
             f"(exact there, near-exact at other sizes); dynamic N/H/W, uint8 in/out.")
 
 
-# onnxruntime execution providers, best-first, with friendly names the device widget shows.
-PROVIDER_LABEL = {"CUDAExecutionProvider": "CUDA", "CoreMLExecutionProvider": "MPS",
-                  "DmlExecutionProvider": "DirectML", "CPUExecutionProvider": "CPU"}
-PROVIDER_ORDER = ["CUDAExecutionProvider", "CoreMLExecutionProvider", "DmlExecutionProvider",
-                  "CPUExecutionProvider"]
-
-
-def _available_providers():
-    try:
-        import onnxruntime as ort
-        avail = set(ort.get_available_providers())
-    except Exception:
-        return []
-    ordered = [p for p in PROVIDER_ORDER if p in avail]
-    if "CPUExecutionProvider" not in ordered:
-        ordered.append("CPUExecutionProvider")
-    return ordered
-
-
-def best_device_name():
-    """Highest compatible device, without building a session (for the idle widget)."""
-    provs = _available_providers()
-    if not provs:
-        return "CPU (onnxruntime not loaded)"
-    return PROVIDER_LABEL.get(provs[0], provs[0])
-
-
-def _make_session(ort):
-    """Build a session on the highest available provider, falling back gracefully through the
-    list until one actually loads. Returns (session, friendly_device_name)."""
-    err = None
-    for prov in _available_providers():
-        try:
-            provs = [prov] if prov == "CPUExecutionProvider" else [prov, "CPUExecutionProvider"]
-            sess = ort.InferenceSession(ONNX_PATH, providers=provs)
-            used = sess.get_providers()[0]                 # the one actually in front
-            return sess, PROVIDER_LABEL.get(used, used)
-        except Exception as e:
-            err = e                                        # provider present but wouldn't init -> try the next
-    raise err or RuntimeError("no execution provider available")
-
-
-def _encoder(w, h, fps):
-    # Control the RGB->YUV matrix and TAG the output BT.709, else the browser assumes 709 over
-    # swscale's 601 default -> the preview colour-shifts vs the gallery stills.
-    return ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-s", f"{w}x{h}", "-r", f"{fps:.0f}", "-color_range", "pc", "-i", "-", "-an",
-            "-vf", "scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p,"
-                   "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709",
-            "-c:v", "libx264", "-crf", "16", "-preset", "fast", "-pix_fmt", "yuv420p", ONNX_PREVIEW]
-
-
 def _run_clip(sess, clip, fps, progress):
     n, B, outs = len(clip), 4, []
     for i in progress.tqdm(range(0, n, B), desc="ONNX defringe"):
         outs.append(sess.run(None, {"rgb": np.ascontiguousarray(clip[i:i + B])})[0])
     frames = np.concatenate(outs, 0)
     h, w = frames.shape[1:3]
-    proc = subprocess.Popen(_encoder(w, h, fps), stdin=subprocess.PIPE)
-    proc.stdin.write(np.ascontiguousarray(frames, np.uint8).tobytes())
-    proc.stdin.close(); proc.wait()
+    with video_io.encoder(w, h, fps, ONNX_PREVIEW) as enc:
+        video_io.write_frames(enc, frames)
     return ONNX_PREVIEW, f"✅ {n} frames @ {fps:.0f}fps → video below ({w}×{h})."
 
 
@@ -448,22 +283,13 @@ def _run_video(sess, video_path, progress):
     """Stream the whole file through ONNX: ffmpeg-decode -> batched inference -> ffmpeg-encode,
     so a 10-minute source never has to fit in memory."""
     w, h, nb, fps = video_io.probe(video_path)
-    dec = subprocess.Popen(["ffmpeg", "-v", "error", "-i", video_path, "-pix_fmt", "rgb24",
-                            "-f", "rawvideo", "-"], stdout=subprocess.PIPE)
-    enc = subprocess.Popen(_encoder(w, h, fps or 25.0), stdin=subprocess.PIPE)
-    fb, B, done = w * h * 3, 4, 0
-    while True:
-        raw = dec.stdout.read(fb * B)
-        if not raw:
-            break
-        k = len(raw) // fb
-        batch = np.frombuffer(raw[:k * fb], np.uint8).reshape(k, h, w, 3)
-        enc.stdin.write(np.ascontiguousarray(sess.run(None, {"rgb": np.ascontiguousarray(batch)})[0], np.uint8).tobytes())
-        done += k
-        if nb:
-            progress(min(done / nb, 1.0), desc=f"ONNX whole video — {done}/{nb}")
-    dec.stdout.close(); dec.wait()
-    enc.stdin.close(); enc.wait()
+    done = 0
+    with video_io.encoder(w, h, fps or 25.0, ONNX_PREVIEW) as enc:
+        for batch in video_io.iter_frame_batches(video_path):
+            video_io.write_frames(enc, sess.run(None, {"rgb": np.ascontiguousarray(batch)})[0])
+            done += len(batch)
+            if nb:
+                progress(min(done / nb, 1.0), desc=f"ONNX whole video — {done}/{nb}")
     return ONNX_PREVIEW, f"✅ whole video — {done} frames @ {fps:.0f}fps → ({w}×{h})."
 
 
@@ -473,13 +299,9 @@ def run_onnx(clip, fps, video_path, scope, progress=gr.Progress()):
     if not os.path.exists(ONNX_PATH):
         return None, "Press **Export ONNX** first.", gr.update()
     try:
-        import onnxruntime as ort
+        sess, device = onnx_runtime.make_session(ONNX_PATH)
     except Exception as e:
-        return None, f"⚠️ onnxruntime not available — try `uv sync`.\n\n`{e}`", gr.update(value="CPU (unavailable)")
-    try:
-        sess, device = _make_session(ort)
-    except Exception as e:
-        return None, f"⚠️ couldn't start a compute device: `{e}`", gr.update()
+        return None, f"⚠️ couldn't start a compute device: `{e}`", gr.update(value="CPU (unavailable)")
     dev = gr.update(value=device)
     if scope == "Whole video":
         if not video_path:
@@ -490,111 +312,22 @@ def run_onnx(clip, fps, video_path, scope, progress=gr.Progress()):
     return (*_run_clip(sess, clip, fps, progress), dev)
 
 
-# Capture-phase handler that intercepts Gradio's per-slider reset (↺) and applies
-# window.__defaults instead of the build-time value, firing input+pointerup so the
-# pipeline re-runs. Seeds the map from the hidden #defaults_blob textbox per load.
-RESET_JS = """
-() => {
-  const seed = () => {
-    try {
-      const t = document.querySelector('#defaults_blob textarea, #defaults_blob input');
-      if (t) window.__defaults = JSON.parse(t.value || '{}');
-    } catch (e) {}
-  };
-  seed();
-  if (!window.__resetHijack) {
-    window.__resetHijack = true;
-    document.addEventListener('click', (e) => {
-      const btn = e.target.closest && e.target.closest('.reset-button');
-      if (!btn) return;
-      const block = btn.closest('[id^="def_"]');
-      if (!block) return;
-      seed();                                      // re-read blob: load-time seed can race empty
-      const d = (window.__defaults || {})[block.id];
-      if (d === undefined) return;                 // unknown -> let native reset run
-      e.preventDefault(); e.stopImmediatePropagation();
-      block.querySelectorAll('input').forEach(inp => {
-        inp.value = d;
-        inp.dispatchEvent(new Event('input', {bubbles: true}));
-        inp.dispatchEvent(new Event('pointerup', {bubbles: true}));
-      });
-    }, true);
-  }
-}
-"""
-
-WHEEL_JS = Path(__file__).with_name("defringe_wheel.js").read_text()
+# Frontend assets live in assets/ (co-located JS/CSS). defringe_wheel.js is the host-agnostic
+# colour-wheel web component; gradio_ui.js is the Gradio binding + load-time DOM glue (mount,
+# reset hijack, collapsibles, profile redraw); acc.css styles the collapsibles. The wheel must
+# load first (gradio_ui.js mounts it), so both are injected into <head> in that order.
+ASSETS = Path(__file__).with_name("assets")
+WHEEL_JS = (ASSETS / "defringe_wheel.js").read_text()
+GRADIO_UI_JS = (ASSETS / "gradio_ui.js").read_text()
+ACC_CSS = (ASSETS / "acc.css").read_text()
 
 
 def acc_head(title, target):
     """Header for a custom CSS collapsible whose body is `#target` (a `.acc-body` column).
     Unlike gr.Accordion it never unmounts its body, so wheel-bound sliders stay readable.
-    Styled (ACC_CSS) to match gr.Accordion's header exactly."""
+    Styled (acc.css) to match gr.Accordion's header exactly."""
     return gr.HTML(f'<div class="acc-head" data-target="{target}">'
                    f'<span>{title}</span><span class="chev">▼</span></div>')
-
-
-# Toggle a custom collapsible: flip `.open` on the body and its header (delegated, so it
-# works for panels that mount later on tab switch). CSS in ACC_CSS hides bodies by default.
-ACCORDION_JS = """
-() => {
-  if (window.__accWired) return;
-  window.__accWired = true;
-  document.addEventListener('click', (e) => {
-    const h = e.target.closest('.acc-head');
-    if (!h) return;
-    const body = document.getElementById(h.getAttribute('data-target'));
-    if (!body) return;
-    h.classList.toggle('open', body.classList.toggle('open'));
-  });
-}
-"""
-
-ACC_CSS = """
-/* .gacc mimics a gr.Accordion .block; .acc-head mimics its .label-wrap button. */
-.gacc{border:1px solid var(--border-color-primary);border-radius:var(--block-radius);
-  background:var(--block-background-fill);padding:var(--block-padding);gap:var(--spacing-lg,8px);}
-.gacc .prose{margin:0;}
-.gacc > div.block{padding:0;border:0;background:none;}   /* header gr.HTML's block: no pad, no 3px focus-border... */
-.gacc .html-container{padding:0;}                         /* ...and its inner container adds no padding */
-.acc-head{display:flex;justify-content:space-between;align-items:center;width:100%;
-  cursor:pointer;user-select:none;color:var(--body-text-color);
-  font-size:var(--block-title-text-size,14px);font-weight:var(--block-title-text-weight,400);}
-.acc-head .chev{font-size:14px;transition:transform .15s ease;transform:rotate(90deg);}
-.acc-head.open .chev{transform:rotate(0deg);}
-.acc-body{display:none;}
-.acc-body.open{display:block;}
-.hidden-blob{display:none !important;}   /* mounted (so RESET_JS can read it) but invisible */
-"""
-
-
-def green_wheel_config():
-    """Build the wheel's data-config from GREEN_REG (call after the sliders exist)."""
-    gid = {e["key"]: f"def_{e['persist']}" for e in GREEN_REG}
-    return json.dumps({"maxChroma": 60, "wedges": [
-        {"ref": alg.RED_REF, "color": "#c0392b",
-         "chroma": gid["caster_min_chroma"], "lo": gid["caster_hue_lo"], "hi": gid["caster_hue_hi"]},
-        {"ref": alg.GREEN_REF, "color": "#148f77",
-         "chroma": gid["fringe_min_chroma"], "lo": gid["fringe_hue_lo"], "hi": gid["fringe_hue_hi"]},
-    ], "sizeReach": {"area": gid["min_area"], "reach": gid["cast_radius"]},
-        "repair": {"strength": gid["max_opacity"], "spread": gid["repair_spread"], "feather": gid["feather"]}})
-
-
-def purple_wheel_config():
-    """Magenta-fringe cone wedge: one wedge around MAGENTA_REF whose axis is Target Hue,
-    angular half-width is Hue Range, and inner radius is Minimum Chroma. The caster is a
-    brightness threshold (not a hue region), so it isn't on the wheel; Excess Threshold is
-    a directional excess, so it stays a slider. Centred on neutral (scene-tone offset omitted)."""
-    pid = {e["key"]: f"def_{e['persist']}" for e in PURPLE_REG}
-    # Same disc geometry & radial scale (60) as the green wheel, so the carved magenta slice lands
-    # exactly where the full disc sat -> the wheel stays put across a tab switch.
-    return json.dumps({"maxChroma": 60, "layout": "source",
-                       "labels": {"left": "Casters", "right": "Shadows"}, "wedges": [
-        {"ref": alg.MAGENTA_REF, "color": "#9b59b6",
-         "chroma": pid["fringe_min_chroma"], "center": pid["target_hue"], "halfwidth": pid["hue_halfwidth"]},
-    ], "source": {"lightness": pid["caster_min_lightness"], "area": pid["min_area"], "reach": pid["cast_radius"]},
-        "excessRing": {"threshold": pid["excess_thresh"]},
-        "repair": {"strength": pid["max_opacity"], "spread": pid["repair_spread"], "feather": pid["feather"]}})
 
 
 with gr.Blocks(title="Defringe tuner") as demo:
@@ -608,8 +341,8 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 load_prof_btn = gr.UploadButton("📂 Load Profile", file_types=[".json"], type="filepath", size="sm", min_width=96)
                 restart_btn = gr.Button("↻ Restart app", size="sm", min_width=96)
             save_def_stat = gr.Markdown("")
-    # CSS-hidden, NOT visible=False: Gradio 6 unmounts invisible components, and RESET_JS
-    # (+ the wheel's reset) seed window.__defaults by reading this element from the DOM.
+    # CSS-hidden, NOT visible=False: Gradio 6 unmounts invisible components, and gradio_ui.js's
+    # reset hijack (+ the wheel's reset) read window.__defaults / this element from the DOM.
     defaults_blob = gr.Textbox(elem_id="defaults_blob", elem_classes="hidden-blob")
     clip_state = gr.State(None)     # extracted video clip (frames)
     still_state = gr.State(None)    # uploaded image (when the source is a still)
@@ -757,13 +490,13 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 onnx_run_btn = gr.Button("② Run → video", variant="primary", interactive=False)
                 onnx_run_stat = gr.Markdown("Upload a video / extract a clip (Tab 0), Export, then Run.")
             with gr.Column(scale=2):
-                onnx_device = gr.Textbox(label="compute device", value=best_device_name(),
+                onnx_device = gr.Textbox(label="compute device", value=onnx_runtime.best_device_name(),
                                          interactive=False, max_lines=1)
                 onnx_video = gr.Video(label="ONNX output", height=420)
 
     # REGs are fully built now, so each wheel's slider element IDs resolve.
-    green_wheel.value = f"<div class='defringe-wheel-mount' data-config='{green_wheel_config()}'></div>"
-    purple_wheel.value = f"<div class='defringe-wheel-mount' data-config='{purple_wheel_config()}'></div>"
+    green_wheel.value = f"<div class='defringe-wheel-mount' data-config='{views.green_wheel_config(GREEN_REG)}'></div>"
+    purple_wheel.value = f"<div class='defringe-wheel-mount' data-config='{views.purple_wheel_config(PURPLE_REG)}'></div>"
 
     ins = [still_state, clip_state, t0_frame, g_on, pc_on,
            *[e["comp"] for e in GREEN_REG], *[e["comp"] for e in PURPLE_REG]]
@@ -799,19 +532,17 @@ with gr.Blocks(title="Defringe tuner") as demo:
     # Seed the reset blob with the constructed values so reset is correct from first
     # load; on save, refresh window.__defaults so reset retargets without a restart.
     reg_comps = [c["comp"] for c in REG]
-    defaults_blob.value = json.dumps({f"def_{c['persist']}": c["comp"].value for c in REG})
+    defaults_blob.value = json.dumps({c["elem_id"]: c["comp"].value for c in REG})
     save_prof_btn.click(export_profile, reg_comps, save_prof_btn)
     # Load: apply to sliders + persist as active profile, then retarget reset / redraw the wheels,
     # then re-run the pipeline with the loaded values.
     load_prof_btn.upload(import_profile, [load_prof_btn], reg_comps + [defaults_blob, save_def_stat]) \
-                 .then(None, defaults_blob, None,
-                       js="(b) => { window.__defaults = JSON.parse(b || '{}'); document.querySelectorAll('defringe-wheel').forEach(w => w.draw && w.draw()); }") \
+                 .then(None, defaults_blob, None, js="(b) => applyProfileDefaults(b)") \
                  .then(run_chain, ins, outs)
     restart_btn.click(restart_app)
     demo.load(run_chain, ins, outs)
-    demo.load(None, None, None, js=RESET_JS)     # per-slider reset -> saved defaults
-    demo.load(None, None, None, js=ACCORDION_JS) # custom collapsibles (wheel-safe)
+    demo.load(None, None, None, js="() => { installResetHijack(); installAccordion(); }")
 
 if __name__ == "__main__":
     demo.launch(server_name="127.0.0.1", server_port=7862, show_error=True, css=ACC_CSS,
-                head=f"<script>{WHEEL_JS}</script>")
+                head=f"<script>{WHEEL_JS}</script><script>{GRADIO_UI_JS}</script>")

@@ -1,0 +1,20 @@
+/* Custom CSS collapsible that never unmounts its body (unlike gr.Accordion), so the
+   wheel-bound sliders inside stay in the DOM for the wheel to read/write.
+   .gacc mimics a gr.Accordion .block; .acc-head mimics its .label-wrap button. */
+.gacc{border:1px solid var(--border-color-primary);border-radius:var(--block-radius);
+  background:var(--block-background-fill);padding:var(--block-padding);gap:var(--spacing-lg,8px);}
+.gacc .prose{margin:0;}
+.gacc > div.block{padding:0;border:0;background:none;}   /* header gr.HTML's block: no pad, no 3px focus-border... */
+.gacc .html-container{padding:0;}                         /* ...and its inner container adds no padding */
+.acc-head{display:flex;justify-content:space-between;align-items:center;width:100%;
+  cursor:pointer;user-select:none;color:var(--body-text-color);
+  font-size:var(--block-title-text-size,14px);font-weight:var(--block-title-text-weight,400);}
+.acc-head .chev{font-size:14px;transition:transform .15s ease;transform:rotate(90deg);}
+.acc-head.open .chev{transform:rotate(0deg);}
+/* Graceful degradation: default-open so the sliders are usable with NO JS. gradio_ui.js sets
+   html.js up front, which is what actually collapses the panels — so JS off => everything open
+   and reachable (vanilla Gradio), JS on => collapsible exactly as before (no flash). */
+.acc-body{display:block;}
+html.js .acc-body{display:none;}
+html.js .acc-body.open{display:block;}
+.hidden-blob{display:none !important;}   /* mounted (so the reset glue can read it) but invisible */

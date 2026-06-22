@@ -1,8 +1,10 @@
 """Torch/ONNX port of the green_cast -> purple_cast pipeline.
 
-Since the scale-space rewrite, defringe_algorithm.py uses the SAME geometry as this port
+Since the scale-space rewrite, defringe_numpy.py uses the SAME geometry as this port
 -- a box-sum count for Minimum Area and a square dilation + gaussian feather for Cast
 Reach -- so the two now closely converge (no more label()/distance_transform_edt gap).
+The relative→px conversion and the reach/area calibration constants live in geometry.py,
+imported by both sides so they can't drift.
 
 Spatial params are resolution-relative; ONNX bakes kernel sizes as graph constants, so they're
 converted to px for a reference resolution (ref_hw, default 1080p) at construction. To stay
@@ -19,7 +21,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from defringe_algorithm import GREEN_CAST, PURPLE_CAST, RED_REF, GREEN_REF, MAGENTA_REF
+import geometry
+from defringe_numpy import GREEN_CAST, PURPLE_CAST, RED_REF, GREEN_REF, MAGENTA_REF
 
 # skimage-matching colour constants (sRGB, D65/2deg)
 _XYZ_FROM_RGB = np.array([[0.412453, 0.357580, 0.180423],
@@ -44,25 +47,19 @@ class Defringe(nn.Module):
 
     def __init__(self, green=None, purple=None, ref_hw=(1080, 1920)):
         super().__init__()
-        # Spatial params arrive resolution-relative (see defringe_algorithm.cast_defringe);
+        # Spatial params arrive resolution-relative (see defringe_numpy.cast_defringe);
         # convert to px for a reference resolution since ONNX kernel sizes are constants.
-        _H, _W = ref_hw; _diag = (_W * _W + _H * _H) ** 0.5; _area = float(_H * _W)
-        def _to_px(P):
-            P = dict(P)
-            for k in ("cast_radius", "feather", "repair_spread", "tone_correction_radius"):
-                P[k] = P[k] * _diag / 1000.0           # per-mille of diagonal -> px
-            P["min_area"] = P["min_area"] * _area / 1e6  # ppm of area -> px^2
-            return P
-        self.g = _to_px({**GREEN_CAST, **(green or {})})
-        self.p = _to_px({**PURPLE_CAST, **(purple or {})})
-        self.ref_diag = float(_diag)                   # reference diagonal the kernels are baked for
+        _H, _W = ref_hw
+        self.g = geometry.relative_to_px({**GREEN_CAST, **(green or {})}, _H, _W)
+        self.p = geometry.relative_to_px({**PURPLE_CAST, **(purple or {})}, _H, _W)
+        self.ref_diag = (_W * _W + _H * _H) ** 0.5     # reference diagonal the kernels are baked for
         self.register_buffer("xyz_from_rgb", torch.tensor(_XYZ_FROM_RGB, dtype=torch.float32))
         self.register_buffer("rgb_from_xyz", torch.tensor(_RGB_FROM_XYZ, dtype=torch.float32))
         self.register_buffer("ref_white", torch.tensor(_REF_WHITE, dtype=torch.float32))
         for tag, P in (("g", self.g), ("p", self.p)):
             for nm, sig in (("feather", P["feather"]),
                             ("tone", P["tone_correction_radius"]),
-                            ("reach", max(P["radius_softness"] * P["cast_radius"] * 0.4, 1e-3))):
+                            ("reach", max(P["radius_softness"] * P["cast_radius"] * geometry.REACH_FEATHER_CALIB, 1e-3))):
                 k, r = _gauss1d(sig)
                 self.register_buffer(f"k_{tag}_{nm}", k)
                 setattr(self, f"r_{tag}_{nm}", r)
@@ -71,7 +68,7 @@ class Defringe(nn.Module):
             # threshold, instead of a morphological opening — an opening needs a
             # solid k×k square to survive and so erased thin highlight rims, the
             # dominant casters for axial-CA purple fringe (heavy under-correction).
-            setattr(self, f"areaw_{tag}", 2 * max(1, int(round(P["min_area"] ** 0.5))) + 1)
+            setattr(self, f"areaw_{tag}", geometry.area_window(P["min_area"]))
 
     # ---- colour ----
     def _mm(self, x, m):
@@ -122,7 +119,7 @@ class Defringe(nn.Module):
             co = caster * (t * t * (3.0 - 2.0 * t))                          # ~ Minimum Area
         else:
             co = caster * (dens >= ma).float()
-        R = max(1, int(round(P["cast_radius"] * 0.8)))                       # 0.8: match numpy reach calib
+        R = max(1, int(round(P["cast_radius"] * geometry.REACH_CALIB)))      # match numpy reach calib
         reach = self._sep(self._dilate(co, 2 * R + 1),                       # ~ Cast Reach
                           getattr(self, f"k_{tag}_reach"), getattr(self, f"r_{tag}_reach")).clamp(0, 1)
         keepS = shadow * reach * (1.0 - co)

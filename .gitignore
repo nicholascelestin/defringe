@@ -52,3 +52,6 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+
+# local scratch — relocated files pending deletion
+archive/

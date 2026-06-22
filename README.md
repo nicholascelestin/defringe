@@ -11,20 +11,25 @@ Fringe is a **shadow cast by a source**. First, find all the sources ("casters")
 
 Green fringe can be cast by purple fringe. If you remove purple fringe first, the green fringe it casts will be orphaned (without a caster), and will be unable to be removed by the green fringe algorithm. So, run green first, then purple.
 
-`defringe_algorithm.py` is the canonical numpy implementation; `cast_torch.py` is its ONNX-exportable twin (convolutions in place of scipy's `label`/EDT). `tests/` pins the twin to the reference so it can't silently drift.
+`defringe_numpy.py` is the canonical numpy implementation; `defringe_torch.py` is its ONNX-exportable twin (convolutions in place of scipy's `label`/EDT). They share `geometry.py` (the resolution-relative → pixel conversion and reach/area calibration) so the two can't drift; `tests/` pins the twin to the reference.
 
 ## Layout
 
 ```
-defringe_algorithm.py  the domain logic (source of truth): green & purple casts,
-                       the shared cast engine, Lab/soft-step helpers — pure numpy/skimage
-app.py              Gradio tuner — live sliders, detect/compare/flicker views
-video_io.py         ffmpeg/ffprobe wrappers (decode to RGB frames)
-cast_torch.py       torch/ONNX twin — tracks the numpy reference
+defringe_numpy.py   the domain logic (source of truth): green & purple casts,
+                    the shared cast engine, Lab/soft-step helpers — pure numpy/skimage
+defringe_torch.py   torch/ONNX twin — tracks the numpy reference
+geometry.py         resolution-relative → pixel conversion + reach/area calibration,
+                    shared by both twins so they can't drift
+app.py              Gradio tuner — layout + event wiring (controllers)
+params.py           the slider registry: defaults, persistence, profile import/export
+views.py            detection overlays + colour-wheel config (presentation)
+video_io.py         ffmpeg wrappers: decode clips/frames, stream-decode, encode
+onnx_runtime.py     ONNX Runtime device selection + session building
+assets/             frontend: defringe_wheel.js, reset.js, accordion.js, acc.css
 cast_defringe.onnx  exported model (uint8 RGB in/out, dynamic N/H/W)
 colab_defringe.ipynb  GPU runner: ONNX over a whole video, colour-correct encode
 tests/              numpy ↔ torch/ONNX conformance (mean/p99 tolerance)
-archive/            superseded detectors, kept for reference
 source/             sample stills + clip
 ```
 

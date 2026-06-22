@@ -1,23 +1,44 @@
-// Interactive a*b* colour wheel that draws a pass's detection wedges live from their
-// sliders, and writes them back when you drag the wedge edges. Vanilla web component.
+// Interactive a*b* colour wheel: draws a pass's detection wedges live from a set of bound
+// numeric parameters, and writes them back when you drag the wedge edges. Framework-agnostic
+// vanilla web component — it touches its parameters ONLY through an injected `adapter`, so it
+// has no knowledge of Gradio (or any host). See gradio_ui.js for the Gradio binding + mount.
 //
-// Each wedge exposes three drag handles, one per slider-backed edge:
-//   • the two radial edges (hue floor / hue ceiling) — drag angularly
-//   • the inner arc (min chroma)                      — drag radially
-// Dragging dispatches `input` (live) then `pointerup` (release) on the target slider,
-// the same path RESET_JS uses, so Gradio re-runs the pipeline on drag-end.
+// Properties (set before the element is appended):
+//   config   { maxChroma, wedges:[{ ref, color, chroma, lo, hi }], sizeReach, repair, ... }
+//            ref = reference hue in degrees (e.g. red=5, teal-green=200); chroma/lo/hi = opaque
+//            parameter ids; the wedge spans absolute hue [ref+lo, ref+hi], inner r = chroma/maxChroma.
+//   adapter  binding to the host's controls (defaults to DOM_ADAPTER below):
+//            read(id)->{value,min,max,step}|null · write(id,v) · commit(id) · defaults()->{id:value}
 //
-// config (set as a property): { maxChroma, wedges: [{ ref, color, chroma, lo, hi }] }
-//   ref           reference hue in degrees (e.g. red=5, teal-green=200)
-//   chroma/lo/hi  elem_ids of the min-chroma / hue-floor / hue-ceiling sliders
-//   the wedge spans absolute hue [ref+lo, ref+hi], inner radius = chroma / maxChroma.
-//
-// The disc is the true CIELAB a*b* plane at a fixed lightness: angle = hue, radius =
-// chroma, each pixel converted Lab -> sRGB. The wheel is built once and cached.
+// Each wedge exposes three drag handles (the hue-floor/ceiling edges drag angularly, the inner
+// arc drags radially). Dragging calls adapter.write (live) then adapter.commit (on release).
+// The disc is the true CIELAB a*b* plane at a fixed lightness; built once and cached.
+
+// Default binding: each id addresses a DOM container `#id` holding a range/number <input>.
+// Read live; writes fire `input`; commit fires `change`. Replace via `el.adapter = …` to bind
+// to another host (see gradio_ui.js, which fires `pointerup` for Gradio's .release).
+const DOM_ADAPTER = {
+  read(id) {
+    const el = document.querySelector('#' + id + ' input[type=range], #' + id + ' input[type=number]');
+    if (!el) return null;
+    return { value: parseFloat(el.value), min: parseFloat(el.min), max: parseFloat(el.max), step: parseFloat(el.step) || 1 };
+  },
+  write(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.querySelectorAll('input').forEach((inp) => { inp.value = value; inp.dispatchEvent(new Event('input', { bubbles: true })); });
+  },
+  commit(id) {
+    const el = document.getElementById(id);
+    if (el) el.querySelectorAll('input').forEach((inp) => inp.dispatchEvent(new Event('change', { bubbles: true })));
+  },
+  defaults() { return window.__wheelDefaults || {}; },
+};
+
 class DefringeWheel extends HTMLElement {
   connectedCallback() {
     if (this._ctx) return;
     this.config = this.config || {};
+    this.adapter = this.adapter || DOM_ADAPTER;          // host binding; DOM by default
     this.size = 260;                                     // disc box (square)
     this._margin = 16;                                   // disc rim -> top/bottom edge
     this.gutter = 64;                                    // side room for the Casters/Shadows captions
@@ -38,8 +59,8 @@ class DefringeWheel extends HTMLElement {
     this._ctx.scale(dpr, dpr);
     this._onInput = (e) => {
       if (this._drag) return;                           // our own writes redraw via the drag loop
-      const b = e.target.closest && e.target.closest('[id^="def_"]');
-      if (b && this._ids().indexOf(b.id) !== -1) this.draw();
+      const b = e.target.closest && e.target.closest('[id]');
+      if (b && this._ids().indexOf(b.id) !== -1) this.draw();   // only my own bound controls
     };
     document.addEventListener('input', this._onInput, true);
     this._handles = [];
@@ -51,18 +72,22 @@ class DefringeWheel extends HTMLElement {
     cv.addEventListener('pointerup', (e) => this._up(e));
     cv.addEventListener('pointercancel', (e) => this._up(e));
     cv.addEventListener('pointerleave', () => this._leave());
-    this._tries = 0;
-    this._poll = setInterval(() => {                     // catch late/lazy slider render
-      this.draw();
-      if (++this._tries > 40) this._stopPoll();          // give up after ~12s
-    }, 300);
+    // The host may render the bound controls after the wheel mounts (and gives no "ready"
+    // signal), so watch the DOM and redraw as they resolve (rAF-coalesced); draw() disconnects
+    // us once every wedge reads non-null.
+    this._resolveObs = new MutationObserver(() => {
+      if (this._rafPending) return;
+      this._rafPending = true;
+      requestAnimationFrame(() => { this._rafPending = false; this.draw(); });
+    });
+    this._resolveObs.observe(document.documentElement, { childList: true, subtree: true });
     this.draw();
   }
   disconnectedCallback() {
     document.removeEventListener('input', this._onInput, true);
-    this._stopPoll();
+    this._stopResolve();
   }
-  _stopPoll() { if (this._poll) { clearInterval(this._poll); this._poll = null; } }
+  _stopResolve() { if (this._resolveObs) { this._resolveObs.disconnect(); this._resolveObs = null; } }
   _geom() {                                             // disc centre/radius in drawing px
     return { cx: this.size / 2 + this.gutter + (this.padLeft || 0), cy: this.size / 2, R: this.size / 2 - this._margin };
   }
@@ -79,35 +104,17 @@ class DefringeWheel extends HTMLElement {
     }
     return best;
   }
-  _input(id) {                                          // the slider's range (or number) input
-    return document.querySelector('#' + id + ' input[type=range], #' + id + ' input[type=number]');
-  }
   _range(id) {
-    const el = this._input(id);
-    if (!el) return null;
-    return { min: parseFloat(el.min), max: parseFloat(el.max), step: parseFloat(el.step) || 1 };
+    const r = this.adapter.read(id);
+    return r ? { min: r.min, max: r.max, step: r.step } : null;
   }
   // value <-> radius for the foot-blob knobs. Concave (gamma < 1) so low/default values get
   // generous room and a large slider range still fits the blob's designated radius -- i.e. the
   // knobs read big by default and compress as you drag toward the edge. _shrink inverts _grow.
   _grow(v, vmax, Lmax) { return Lmax * Math.pow(Math.max(0, v) / Math.max(vmax, 1e-6), 0.6); }
   _shrink(px, vmax, Lmax) { return Math.max(vmax, 1e-6) * Math.pow(Math.max(0, px) / Math.max(Lmax, 1e-6), 1 / 0.6); }
-  _setSlider(id, val) {
-    const block = document.getElementById(id);
-    if (!block) return;
-    block.querySelectorAll('input').forEach((inp) => {
-      inp.value = val;
-      inp.dispatchEvent(new Event('input', { bubbles: true }));
-    });
-  }
-  _releaseSlider(id) {                                   // mirror RESET_JS: pointerup triggers .release
-    const block = document.getElementById(id);
-    if (!block) return;
-    block.querySelectorAll('input').forEach((inp) => {
-      inp.dispatchEvent(new Event('pointerup', { bubbles: true }));
-      inp.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-  }
+  _setSlider(id, val) { this.adapter.write(id, val); }   // live update through the binding
+  _releaseSlider(id) { this.adapter.commit(id); }        // finalize -> host re-runs its pipeline
   _overReset(px, py) {
     const b = this._resetBtn;
     return b && px >= b.x0 && px <= b.x1 && py >= b.y0 && py <= b.y1;
@@ -123,13 +130,7 @@ class DefringeWheel extends HTMLElement {
     ctx.lineTo(hx + 3 * px, hy + 3 * py); ctx.lineTo(hx - 3 * px, hy - 3 * py);
     ctx.closePath(); ctx.fill();
   }
-  _defaults() {                                         // read saved defaults fresh from the blob
-    try {                                               // (window.__defaults can be a stale load-time snapshot)
-      const t = document.querySelector('#defaults_blob textarea, #defaults_blob input');
-      if (t && t.value) return JSON.parse(t.value);
-    } catch (e) { /* fall through */ }
-    return window.__defaults || {};
-  }
+  _defaults() { return this.adapter.defaults(); }        // reset targets (host-provided)
   _reset() {                                            // restore the wheel's sliders to saved defaults
     const d = this._defaults();
     const ids = this._ids().filter((id) => d[id] !== undefined && document.getElementById(id));
@@ -224,8 +225,8 @@ class DefringeWheel extends HTMLElement {
     return out;
   }
   _val(id) {
-    const el = this._input(id);
-    return el ? parseFloat(el.value) : null;
+    const r = this.adapter.read(id);
+    return r ? r.value : null;
   }
   _rgba(hex, a) {
     const n = parseInt(hex.slice(1), 16);
@@ -324,7 +325,7 @@ class DefringeWheel extends HTMLElement {
     if (this.config.repair) this._drawRepair(ctx);
     const activeId = this._drag ? this._drag.id : this._hoverId;
     for (const h of this._handles) if (!h.custom) this._drawHandle(ctx, cx, cy, h, h.id === activeId);
-    if (wedges.length && resolved === wedges.length) this._stopPoll();   // every wedge live -> stop catch-up
+    if (wedges.length && resolved === wedges.length) this._stopResolve();   // every wedge live -> stop watching
   }
   // Purple "source" layout: the SAME disc as green, carved down to just the magenta wedge --
   // real a*b* colours clipped to that slice, sitting where the green disc sat. The source-
@@ -373,7 +374,7 @@ class DefringeWheel extends HTMLElement {
     this._drawSourceBlob(ctx, src, light, area, reach, cx - 0.78 * R, cy);
     if (this.config.repair) this._drawRepair(ctx);
     if (this.config.excessRing) this._drawExcessRing(ctx);   // ambient-centred excess-over-tone blob (right foot)
-    this._stopPoll();
+    this._stopResolve();
   }
   _drawSourceBlob(ctx, src, light, area, reach, bcx, bcy) {
     const rg = this._range(src.lightness) || { min: 0, max: 100 };
@@ -603,19 +604,3 @@ class DefringeWheel extends HTMLElement {
   }
 }
 if (!customElements.get('defringe-wheel')) customElements.define('defringe-wheel', DefringeWheel);
-
-// Bootstrap: upgrade each placeholder div Gradio renders into a wheel. A custom
-// element inside gr.HTML can be sanitised away, so we mount from a plain div.
-function mountDefringeWheels() {
-  for (const div of document.querySelectorAll('.defringe-wheel-mount')) {
-    if (div._mounted) continue;
-    let cfg;
-    try { cfg = JSON.parse(div.getAttribute('data-config') || '{}'); } catch (e) { continue; }
-    div._mounted = true;
-    const el = document.createElement('defringe-wheel');
-    el.config = cfg;
-    div.appendChild(el);
-  }
-}
-new MutationObserver(mountDefringeWheels).observe(document.documentElement, { childList: true, subtree: true });
-mountDefringeWheels();

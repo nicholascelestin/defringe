@@ -3,14 +3,36 @@
 local tone -- and differ only in how they define caster/fringe/strength (shared back
 end: cast_defringe). Chain green-first; purple fringe can itself cast green fringe.
 
-    g, _ = green_cast(rgb); out, _ = purple_cast(g)
+    out = defringe(rgb)                       # the canonical green->purple pipeline
+    cast = green_cast(rgb); cast.image, cast.alpha   # one pass, with detection detail
 """
+from dataclasses import dataclass
+
 import numpy as np
 from skimage.color import rgb2lab, lab2rgb
 from scipy.ndimage import gaussian_filter, maximum_filter, uniform_filter
 
-__all__ = ["green_cast", "purple_cast", "cast_defringe",
+import geometry
+
+__all__ = ["defringe", "green_cast", "purple_cast", "cast_defringe", "Cast",
            "GREEN_CAST", "PURPLE_CAST", "RED_REF", "GREEN_REF", "MAGENTA_REF"]
+
+
+@dataclass(frozen=True)
+class Cast:
+    """One pass's result: the corrected frame plus the detection it acted on.
+    `caster` is what survived the area test; `caster_raw` is the raw detection."""
+    image: np.ndarray       # corrected uint8 RGB (untouched pixels bit-exact)
+    alpha: np.ndarray       # per-pixel correction opacity in [0, max_opacity]
+    caster: np.ndarray      # casters that passed the Minimum-Area test (bool)
+    caster_raw: np.ndarray  # raw caster detection, pre-area (bool)
+
+
+def defringe(rgb, green=None, purple=None):
+    """Canonical pipeline: green fringe first (purple fringe can itself cast green, so
+    removing purple first would orphan it), then purple. -> corrected uint8 RGB."""
+    g = green_cast(rgb, **(green or {}))
+    return purple_cast(g.image, **(purple or {})).image
 
 
 # ── colour-space + shared helpers ────────────────────────────────────────────
@@ -66,7 +88,7 @@ def local_tone(a, b, trust, sigma):
 def cast_defringe(src, lab, caster, fringe, strength, p):
     """Shared back end: gate `fringe` by reach to a nearby `caster`, build a feathered
     alpha from `strength`, pull chroma to the trusted local tone (L kept).
-    -> (uint8, {alpha, caster, caster_raw, shadow}); untouched pixels bit-exact.
+    -> Cast; untouched pixels (alpha == 0) bit-exact.
 
     Geometry is scale-space and resolution-relative: the spatial params arrive as
     fractions of the frame and convert to px from the frame's own size, so a setting
@@ -78,17 +100,17 @@ def cast_defringe(src, lab, caster, fringe, strength, p):
     caster_raw is the raw detection; caster is what survived the area test."""
     L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
     H, W = L.shape
-    diag = (W * W + H * H) ** 0.5
-    min_area = p["min_area"] * (H * W) / 1e6                     # ppm of area  -> px^2
-    reach = p["cast_radius"] * diag / 1000.0                    # per-mille of diagonal -> px
-    feather = p["feather"] * diag / 1000.0
-    spread = p["repair_spread"] * diag / 1000.0
-    tone_radius = p["tone_correction_radius"] * diag / 1000.0
+    px = geometry.relative_to_px(p, H, W)
+    min_area = px["min_area"]                                    # ppm of area  -> px^2
+    reach = px["cast_radius"]                                    # per-mille of diagonal -> px
+    feather = px["feather"]
+    spread = px["repair_spread"]
+    tone_radius = px["tone_correction_radius"]
 
     cf = caster.astype(np.float32)
     # Minimum Area as a local bright-pixel count (box-sum), soft-thresholded into a
     # continuous per-pixel caster weight -- marginal-size casters ramp in, not pop.
-    wa = 2 * max(1, int(round(min_area ** 0.5))) + 1
+    wa = geometry.area_window(min_area)
     count = uniform_filter(cf, wa) * float(wa * wa)
     caster_w = cf * soft_step(count, min_area - 0.5, max(p["area_softness"], 1e-6) * min_area)
     caster_mask = caster_w > 0.5
@@ -96,9 +118,9 @@ def cast_defringe(src, lab, caster, fringe, strength, p):
     # Cast Reach as a square dilation of the kept-caster field (which carries the area
     # weight) plus a gaussian feather; 0.8/0.4 calibrate the square footprint to the
     # former Euclidean reach. reach_weight ~ 1 over caster + reach, decaying outward.
-    R = max(1, int(round(reach * 0.8)))
+    R = max(1, int(round(reach * geometry.REACH_CALIB)))
     reach_weight = np.clip(gaussian_filter(maximum_filter(caster_w, size=2 * R + 1),
-                                           max(p["radius_softness"] * reach * 0.4, 1e-3)), 0, 1)
+                                           max(p["radius_softness"] * reach * geometry.REACH_FEATHER_CALIB, 1e-3)), 0, 1)
     candidate = fringe & (reach_weight > 1e-3) & (~caster_mask)
     shadow_strength = candidate.astype(np.float32) * reach_weight
     donor = np.ones(L.shape, np.float32)
@@ -115,7 +137,7 @@ def cast_defringe(src, lab, caster, fringe, strength, p):
     tone_a, tone_b = local_tone(a, b, trust, tone_radius)
     out = lab_to_rgb(np.stack([L, a + alpha * (tone_a - a), b + alpha * (tone_b - b)], -1))
     out = composite(out, src, alpha)
-    return out, {"alpha": alpha, "caster": caster_mask, "caster_raw": caster, "shadow": shadow_strength > 0}
+    return Cast(image=out, alpha=alpha, caster=caster_mask, caster_raw=caster)
 
 
 # ── green pass ───────────────────────────────────────────────────────────────
@@ -149,7 +171,7 @@ GREEN_CAST = dict(
 
 
 def green_cast(rgb, **kw):
-    """Remove green fringe cast by saturated red/purple sources. -> (uint8, info)."""
+    """Remove green fringe cast by saturated red/purple sources. -> Cast."""
     p = {**GREEN_CAST, **kw}
     src = np.asarray(rgb, np.float32)
     lab = rgb_to_lab(src)
@@ -191,7 +213,7 @@ PURPLE_CAST = dict(
 
 
 def purple_cast(rgb, **kw):
-    """Remove purple fringe cast by blown highlights. -> (uint8, info)."""
+    """Remove purple fringe cast by blown highlights. -> Cast."""
     p = {**PURPLE_CAST, **kw}
     src = np.asarray(rgb, np.float32)
     lab = rgb_to_lab(src)

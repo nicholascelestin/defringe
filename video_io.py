@@ -7,7 +7,8 @@ algorithms are skimage/rgb2lab-native.
 import json
 import os
 import subprocess
-from typing import Optional, Tuple
+from contextlib import contextmanager
+from typing import Iterator, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -75,3 +76,54 @@ def sample_indices(nb: int, max_n: int) -> np.ndarray:
     """Evenly-spaced frame indices, at most max_n of them."""
     step = max(1, nb // max_n) if nb else 1
     return np.arange(0, nb, step)
+
+
+# ── encode ───────────────────────────────────────────────────────────────────
+
+def encode_command(w: int, h: int, fps: float, out_path: str) -> list:
+    """ffmpeg argv: raw rgb24 on stdin → BT.709-tagged H.264 mp4 at `out_path`.
+    We control the RGB→YUV matrix and TAG the output BT.709, else a browser assumes 709
+    over swscale's 601 default → the preview colour-shifts vs the gallery stills."""
+    return ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{w}x{h}", "-r", f"{fps:.0f}", "-color_range", "pc", "-i", "-", "-an",
+            "-vf", "scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p,"
+                   "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+            "-c:v", "libx264", "-crf", "16", "-preset", "fast", "-pix_fmt", "yuv420p", out_path]
+
+
+@contextmanager
+def encoder(w: int, h: int, fps: float, out_path: str):
+    """ffmpeg encoder as a context manager: write contiguous uint8 RGB frames via
+    `write_frames`, the block exit flushes stdin and waits for the mux to finish."""
+    proc = subprocess.Popen(encode_command(w, h, fps, out_path), stdin=subprocess.PIPE)
+    try:
+        yield proc
+    finally:
+        proc.stdin.close()
+        proc.wait()
+
+
+def write_frames(enc, frames: np.ndarray) -> None:
+    """Push a batch of RGB frames into an open `encoder`."""
+    enc.stdin.write(np.ascontiguousarray(frames, np.uint8).tobytes())
+
+
+# ── streaming decode ─────────────────────────────────────────────────────────
+
+def iter_frame_batches(path: str, batch: int = 4) -> Iterator[np.ndarray]:
+    """Stream a whole video as uint8 RGB batches [k,H,W,3] via ffmpeg, so a long source
+    never has to fit in memory. Probe separately for nb/fps if you need progress totals."""
+    w, h, _, _ = probe(path)
+    dec = subprocess.Popen(["ffmpeg", "-v", "error", "-i", path, "-pix_fmt", "rgb24",
+                            "-f", "rawvideo", "-"], stdout=subprocess.PIPE)
+    fb = w * h * 3
+    try:
+        while True:
+            raw = dec.stdout.read(fb * batch)
+            if not raw:
+                break
+            k = len(raw) // fb
+            yield np.frombuffer(raw[:k * fb], np.uint8).reshape(k, h, w, 3)
+    finally:
+        dec.stdout.close()
+        dec.wait()

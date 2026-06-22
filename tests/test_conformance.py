@@ -1,6 +1,6 @@
 """Conformance: the torch/ONNX port must track the numpy reference to within 8-bit rounding.
 
-defringe_algorithm.py is canonical; cast_torch.py is its ONNX-able twin. They share the same
+defringe_numpy.py is canonical; defringe_torch.py is its ONNX-able twin. They share the same
 scale-space geometry (box-sum count for Minimum Area, square dilation + gaussian feather for
 Cast Reach), so the only divergence is float32 op-by-op noise and the final uint8 rounding:
 on the 1080p stills below that's ~mean 0.03 / p99 1 / max 8, and ~94% of pixels are byte-
@@ -12,7 +12,7 @@ import pytest
 from PIL import Image
 
 import video_io
-import defringe_algorithm as alg
+import defringe_numpy as alg
 
 STILLS = ["source/inside.webp", "source/horses.png",
           "source/building.webp", "source/people.webp"]
@@ -21,9 +21,7 @@ INV_MEAN_TOL, INV_P99_TOL = 0.3, 4          # off-reference (resampled) match to
 
 
 def _numpy_reference(img):
-    g, _ = alg.green_cast(img)
-    out, _ = alg.purple_cast(g)
-    return out
+    return alg.defringe(img)
 
 
 def _within_tolerance(out, ref):
@@ -34,7 +32,7 @@ def _within_tolerance(out, ref):
 @pytest.fixture(scope="module")
 def torch_model():
     torch = pytest.importorskip("torch")
-    from cast_torch import Defringe
+    from defringe_torch import Defringe
     return torch, Defringe().eval()
 
 
