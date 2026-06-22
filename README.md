@@ -11,7 +11,7 @@ Fringe is a **shadow cast by a source**. First, find all the sources ("casters")
 
 Green fringe can be cast by purple fringe. If you remove purple fringe first, the green fringe it casts will be orphaned (without a caster), and will be unable to be removed by the green fringe algorithm. So, run green first, then purple.
 
-`defringe_algorithm.py` is the canonical numpy implementation; `cast_torch.py` is an ONNX-exportable port that approximates it (convolutions in place of scipy's `label`/EDT, no per-caster area weighting). `tests/` pins the port within tolerance of the reference so it can't silently drift.
+`defringe_algorithm.py` is the canonical numpy implementation; `cast_torch.py` is its ONNX-exportable twin (convolutions in place of scipy's `label`/EDT). `tests/` pins the twin to the reference so it can't silently drift.
 
 ## Layout
 
@@ -20,7 +20,7 @@ defringe_algorithm.py  the domain logic (source of truth): green & purple casts,
                        the shared cast engine, Lab/soft-step helpers — pure numpy/skimage
 app.py              Gradio tuner — live sliders, detect/compare/flicker views
 video_io.py         ffmpeg/ffprobe wrappers (decode to RGB frames)
-cast_torch.py       torch/ONNX port — approximates the numpy reference
+cast_torch.py       torch/ONNX twin — tracks the numpy reference
 cast_defringe.onnx  exported model (uint8 RGB in/out, dynamic N/H/W)
 colab_defringe.ipynb  GPU runner: ONNX over a whole video, colour-correct encode
 tests/              numpy ↔ torch/ONNX conformance (mean/p99 tolerance)

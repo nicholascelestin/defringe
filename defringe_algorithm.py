@@ -210,10 +210,15 @@ def purple_cast(rgb, **kw):
     lighting_a = float((lit_weight * a).sum() / weight_sum)
     lighting_b = float((lit_weight * b).sum() / weight_sum)
     excess_a, excess_b = a - lighting_a, b - lighting_b
-    magenta_excess = excess_a * axis_a + excess_b * axis_b
+    # Excess = RADIAL distance from the scene tone (any direction). The angular gate below
+    # restricts which direction counts, so this stays magenta-specific; within that hue cone
+    # it is equivalent to the old axis projection (excess_a*axis_a+excess_b*axis_b), and it
+    # matches the ambient-centred "excess over ambient" wheel (distance from centre = excess).
+    magenta_proj = excess_a * axis_a + excess_b * axis_b   # signed projection: used only for the angular gate
+    magenta_excess = np.hypot(excess_a, excess_b)
     # angular gate on the excess vector, soft-edged so it doesn't flip frame to frame
     off_axis = -excess_a * axis_b + excess_b * axis_a
-    off_axis_deg = np.degrees(np.arctan2(np.abs(off_axis), magenta_excess))
+    off_axis_deg = np.degrees(np.arctan2(np.abs(off_axis), magenta_proj))
     hue_weight = soft_step(-off_axis_deg, -(p["hue_halfwidth"] + 1e-6), p["hue_softness"])
     fringe = (chroma > p["fringe_min_chroma"]) & (magenta_excess > p["excess_thresh"]) & (hue_weight > 0)
     strength = np.clip((magenta_excess - p["excess_thresh"]) / max(p["full_strength_span"], 1e-3), 0, 1) * hue_weight

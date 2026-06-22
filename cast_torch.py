@@ -4,11 +4,13 @@ Since the scale-space rewrite, defringe_algorithm.py uses the SAME geometry as t
 -- a box-sum count for Minimum Area and a square dilation + gaussian feather for Cast
 Reach -- so the two now closely converge (no more label()/distance_transform_edt gap).
 
-Spatial params are resolution-relative; ONNX bakes kernel sizes as graph constants, so they
-are converted to px for a reference resolution at construction (ref_hw, default 1080p) --
-re-instantiate with ref_hw=frame.shape[:2] to bake another size. Both passes are fully
-convolutional: rgb<->lab, threshold, avg_pool (area), max_pool (reach), separable gaussian,
-pointwise.
+Spatial params are resolution-relative; ONNX bakes kernel sizes as graph constants, so they're
+converted to px for a reference resolution (ref_hw, default 1080p) at construction. To stay
+resolution-invariant regardless, forward() resamples the frame to the reference diagonal, runs
+the pipeline, then resizes the correction *delta* back and applies it to the original -- so one
+exported model is geometrically correct at any input size (and bit-exact at the reference, where
+the resizes are no-ops). Both passes are fully convolutional: rgb<->lab, threshold, avg_pool
+(area), max_pool (reach), separable gaussian, pointwise.
 
   forward(rgb): (N,H,W,3) uint8 -> (N,H,W,3) uint8   (norm/transpose baked in)
 """
@@ -53,6 +55,7 @@ class Defringe(nn.Module):
             return P
         self.g = _to_px({**GREEN_CAST, **(green or {})})
         self.p = _to_px({**PURPLE_CAST, **(purple or {})})
+        self.ref_diag = float(_diag)                   # reference diagonal the kernels are baked for
         self.register_buffer("xyz_from_rgb", torch.tensor(_XYZ_FROM_RGB, dtype=torch.float32))
         self.register_buffer("rgb_from_xyz", torch.tensor(_RGB_FROM_XYZ, dtype=torch.float32))
         self.register_buffer("ref_white", torch.tensor(_REF_WHITE, dtype=torch.float32))
@@ -144,8 +147,7 @@ class Defringe(nn.Module):
         keep = (alpha > 0).float()
         return out, keep
 
-    def forward(self, rgb):                            # (N,H,W,3) uint8
-        x = rgb.permute(0, 3, 1, 2).to(torch.float32) / 255.0
+    def _pipeline(self, x):                           # float NCHW [0,1] -> corrected float NCHW [0,1]
         lab = self.rgb2lab(x)
         a, b = lab[:, 1:2], lab[:, 2:3]
         chroma = torch.sqrt(a * a + b * b + 1e-12)
@@ -174,11 +176,12 @@ class Defringe(nn.Module):
         a_ref = (wmask * a2).sum(dim=(2, 3), keepdim=True) / wsum
         b_ref = (wmask * b2).sum(dim=(2, 3), keepdim=True) / wsum
         ex_a, ex_b = a2 - a_ref, b2 - b_ref
-        mexcess = ex_a * um_a + ex_b * um_b
+        mproj = ex_a * um_a + ex_b * um_b                              # signed projection: angular gate only
+        mexcess = (ex_a * ex_a + ex_b * ex_b).clamp_min(0).sqrt()    # RADIAL distance from the scene tone (hypot; ONNX-safe)
         # angular gate: accept only excess hues within +-hue_halfwidth of the target
         # direction (mirrors purple_cast.py). soft_step smoothstep feathers the edge.
         perp = -ex_a * um_b + ex_b * um_a
-        ang = torch.atan2(perp.abs(), mexcess) * (180.0 / np.pi)        # 0 = on target hue
+        ang = torch.atan2(perp.abs(), mproj) * (180.0 / np.pi)         # 0 = on target hue
         hw, hsoft = self.p["hue_halfwidth"] + 1e-6, self.p["hue_softness"]
         if hsoft > 0:
             t = ((-ang - (-hw)) / (2.0 * hsoft) + 0.5).clamp(0, 1)
@@ -189,5 +192,22 @@ class Defringe(nn.Module):
         pstrength = (((mexcess - self.p["excess_thresh"]) / max(self.p["full_strength_span"], 1e-3)).clamp(0, 1)) * hue_w
         pout, pkeep = self._pass(lab2, self.p, "p", pcaster, pshadow, pstrength)
         px = pkeep * pout + (1.0 - pkeep) * gx                      # composite purple
-        y = (px.clamp(0.0, 1.0) * 255.0).round()
+        return px
+
+    def forward(self, rgb):                            # (N,H,W,3) uint8 -> (N,H,W,3) uint8
+        x0 = rgb.permute(0, 3, 1, 2).to(torch.float32) / 255.0
+        # Resolution invariance: the kernel sizes are baked for ref_hw, so resample the frame to
+        # the reference diagonal (aspect-preserving), run the pipeline there, resize the correction
+        # delta back, and add it to the original -- untouched detail is preserved (the delta is ~0
+        # there) and the geometry is right at any input size. At the reference size scale==1, the
+        # resizes are exact no-ops, so it stays bit-for-bit identical to the in-place pipeline.
+        shp = torch._shape_as_tensor(x0).to(torch.float32)
+        scale = self.ref_diag / torch.sqrt(shp[2] * shp[2] + shp[3] * shp[3] + 1e-12)
+        ch = (shp[2] * scale).round().clamp(min=1.0).to(torch.int64)
+        cw = (shp[3] * scale).round().clamp(min=1.0).to(torch.int64)
+        xc = F.interpolate(x0, size=[ch, cw], mode="bilinear", align_corners=False)
+        delta = self._pipeline(xc) - xc
+        shp0 = torch._shape_as_tensor(x0)
+        delta = F.interpolate(delta, size=[shp0[2], shp0[3]], mode="bilinear", align_corners=False)
+        y = ((x0 + delta).clamp(0.0, 1.0) * 255.0).round()
         return y.permute(0, 2, 3, 1).to(torch.uint8)
