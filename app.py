@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""Defringe tuner — a tabbed Gradio app: layout + event wiring.
-
-Source: pick a still or extract a 10s video clip. Green / Purple: tune each pass
-(toggleable) live. Temporal: flicker stats over 6 frames. ONNX export: bake the
-current settings into a portable model.
-
-The heavy lifting lives in siblings: defringe_numpy (the algorithm), params (the slider
-registry / persistence that drives the pipeline call, reset, and wheel), views (detection
-overlays + wheel config), video_io / onnx_runtime (I/O + device). This file is the
-controllers + the Blocks tree that glue them together.
-
-Run:  uv run python app.py
-"""
 import os
 import sys
 import json
@@ -21,27 +8,38 @@ from pathlib import Path
 import numpy as np
 import gradio as gr
 import matplotlib
-matplotlib.use("Agg")               # headless: render plots to arrays, no display
+matplotlib.use("Agg")
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 
 import video_io
 import onnx_runtime
 import views
+import parameters
 import defringe_numpy as alg
-from params import S, GREEN_REG, PURPLE_REG, REG, split, export_profile, import_profile
+from sliders import slider, GREEN_REG, PURPLE_REG, REG, split, export_profile, import_profile
 
-DEFAULT_SECS = 10        # clip length to grab into memory, in seconds
-ONNX_PATH = "cast_defringe.onnx"            # exported model (green->purple cast)
-ONNX_PREVIEW = "onnx_preview.mp4"           # last ONNX-on-clip render (gitignored)
+DEFAULT_SECS = 10
+ONNX_PATH = "cast_defringe.onnx"
+ONNX_PREVIEW = "onnx_preview.mp4"
+TEMPORAL_N = 6
+STATIC_MOTION = 2.0     # input barely moved between frames (per-channel mean |Δ|, 0-255 levels)
+TOGGLE_LEVEL = 0.1      # alpha crossing this = a pixel flipping in/out of correction
 
 if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
     print("⚠ ffmpeg/ffprobe not on PATH — video upload needs them "
           "(brew install ffmpeg / apt install ffmpeg). Images still work.")
 
 
+def gslider(name):
+    return slider(parameters.GREEN_BY_NAME[name], GREEN_REG, "green")
+
+
+def pslider(name):
+    return slider(parameters.PURPLE_BY_NAME[name], PURPLE_REG, "purple")
+
+
 def current_frame(still, clip, idx):
-    """The frame the pipeline tunes on: an uploaded still, else the current clip frame."""
     if still is not None:
         return still
     if clip is not None and len(clip):
@@ -50,13 +48,10 @@ def current_frame(still, clip, idx):
 
 
 def restart_app():
-    """Re-exec the process: a fresh server on the same port (also picks up code edits).
-    The in-memory clip is lost; saved defaults persist on disk."""
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 def run_chain(still, clip, idx, g_on, pc_on, *vals):
-    """frame -> [green] -> [purple]; returns the six tab-1 / tab-2 outputs."""
     rgb = current_frame(still, clip, idx)
     if rgb is None:
         return None, None, "no frame", None, None, "no frame"
@@ -89,10 +84,8 @@ def run_chain(still, clip, idx, g_on, pc_on, *vals):
 
 
 def on_upload(path):
-    """Route an upload: an image becomes the tuning frame; a video reveals the seek /
-    seconds / extract controls. Returns updates across the Source tab."""
     hide, off = gr.update(visible=False), gr.update(interactive=False)
-    if not path:                                          # cleared
+    if not path:
         return (None, None, None, "", None, None,
                 hide, hide, hide, hide, hide, hide, off, off)
     if video_io.is_video(path):
@@ -101,24 +94,21 @@ def on_upload(path):
         info = f"video {w}x{h} {fps:.0f}fps {dur:.0f}s — set seconds & seek, then Extract"
         return (None, None, path, info, video_io.read_frame(path, 0.0, max_w=960), None,
                 gr.update(visible=True, maximum=max(0, dur), value=0),       # seek
-                gr.update(visible=True), gr.update(visible=True),            # secs/extract
+                gr.update(visible=True), gr.update(visible=True),            # secs / extract
                 hide, hide, hide, off,                    # clip scrubbers + temporal btn (need a clip)
-                gr.update(interactive=True))              # onnx run: a video is enough (whole-video scope)
+                gr.update(interactive=True))              # onnx run (a video is enough — whole-video scope)
     img = video_io.read_image(path)
     return (img, None, None, f"image {img.shape[1]}x{img.shape[0]}", None, img,
             hide, hide, hide, hide, hide, hide, off, off)
 
 
 def seek_preview(video_path, start_sec):
-    """Single frame at the seek point, so you can see where the clip will start."""
     if not video_path:
         return None
     return video_io.read_frame(video_path, float(start_sec), max_w=960)
 
 
 def extract_clip(video_path, start_sec, secs):
-    """Decode `secs` seconds from `video_path` into memory at full res; the clip becomes
-    the active source (clears any uploaded still)."""
     if not video_path:
         return (None, None, "Upload a video first.", None, gr.update(), gr.update(),
                 gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=False), 25.0)
@@ -132,110 +122,105 @@ def extract_clip(video_path, start_sec, secs):
 
 
 def pick_preview(still, clip, idx):
-    f = current_frame(still, clip, idx)
-    return f if f is not None else np.zeros((80, 80, 3), np.uint8)
+    frame = current_frame(still, clip, idx)
+    return frame if frame is not None else np.zeros((80, 80, 3), np.uint8)
 
 
 def mirror_frame(v):
-    """Keep the four frame sliders (tabs 0/1/2/3) in lockstep."""
     return v, v, v
 
 
-TEMPORAL_N = 6   # current frame + next 5
+def _stage_metrics(corrected_frames, input_frames, alphas, n):
+    corrections = [corrected_frames[i] - input_frames[i] for i in range(n)]
+    static, alpha_change, per_pair, toggled = [], [], [], []
+    for i in range(1, n):
+        input_motion = np.abs(input_frames[i] - input_frames[i - 1]).mean(-1)
+        correction_change = np.abs(corrections[i] - corrections[i - 1]).mean(-1)
+        corrected = (alphas[i] > 0) | (alphas[i - 1] > 0)
+        nearly_still = (input_motion < STATIC_MOTION) & corrected
+        per_pair.append(float(correction_change[corrected].mean()) if corrected.any() else 0.0)
+        if nearly_still.any():
+            static.append(float(correction_change[nearly_still].mean()))
+        if corrected.any():
+            alpha_change.append(float(np.abs(alphas[i] - alphas[i - 1])[corrected].mean()))
+        toggled.append(float(((alphas[i] > TOGGLE_LEVEL) != (alphas[i - 1] > TOGGLE_LEVEL)).mean()))
+    coverage = np.mean([(a > 0).mean() for a in alphas])
+    return dict(static=float(np.mean(static)) if static else 0.0,
+                dalpha=float(np.mean(alpha_change)) if alpha_change else 0.0,
+                toggle=float(np.mean(toggled)) * 100,
+                cov=float(coverage) * 100,
+                per_pair=per_pair)
 
 
-def _pair_plot(green_pp, purple_pp, i0):
-    """Line plot of per-frame-pair correction flicker (on corrected pixels)."""
+def _pair_plot(green_per_pair, purple_per_pair, start):
     fig, ax = plt.subplots(figsize=(5.2, 2.6), dpi=100)
-    xs = range(len(green_pp))
-    labels = [f"{i0+k}→{i0+k+1}" for k in xs]
-    ax.plot(xs, green_pp, "-o", color="#2ca02c", label="green")
-    ax.plot(xs, purple_pp, "-o", color="#9467bd", label="purple")
+    xs = range(len(green_per_pair))
+    labels = [f"{start+k}→{start+k+1}" for k in xs]
+    ax.plot(xs, green_per_pair, "-o", color="#2ca02c", label="green")
+    ax.plot(xs, purple_per_pair, "-o", color="#9467bd", label="purple")
     ax.set_xticks(list(xs)); ax.set_xticklabels(labels, fontsize=7)
     ax.set_ylabel("mean |Δcorrection| /255", fontsize=8)
     ax.set_title("flicker per frame-pair (corrected px)", fontsize=9)
     ax.set_ylim(bottom=0); ax.grid(alpha=0.3); ax.legend(fontsize=8)
     fig.tight_layout()
     fig.canvas.draw()
-    img = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+    plot = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
     plt.close(fig)
-    return img
-
-
-def _stage_metrics(out, inp, alphas, n):
-    """Flicker stats for one stage: out vs its input, weighted by its alpha."""
-    corr = [out[i] - inp[i] for i in range(n)]
-    d_in = [np.abs(inp[i] - inp[i-1]).mean(-1) for i in range(1, n)]
-    d_corr = [np.abs(corr[i] - corr[i-1]).mean(-1) for i in range(1, n)]
-    reg = [(alphas[i] > 0) | (alphas[i-1] > 0) for i in range(1, n)]
-    d_a = [np.abs(alphas[i] - alphas[i-1]) for i in range(1, n)]
-    tog = [(alphas[i] > 0.1) != (alphas[i-1] > 0.1) for i in range(1, n)]
-    static = [float(d_corr[i][(d_in[i] < 2.0) & reg[i]].mean())
-              for i in range(n-1) if ((d_in[i] < 2.0) & reg[i]).any()]
-    dalpha = [float(d_a[i][reg[i]].mean()) for i in range(n-1) if reg[i].any()]
-    per_pair = [float(d_corr[i][reg[i]].mean()) if reg[i].any() else 0.0 for i in range(n-1)]
-    return dict(static=float(np.mean(static)) if static else 0.0,
-                dalpha=float(np.mean(dalpha)) if dalpha else 0.0,
-                toggle=float(np.mean([t.mean() for t in tog]) * 100),
-                cov=float(np.mean([(a > 0).mean() for a in alphas]) * 100),
-                per_pair=per_pair)
+    return plot
 
 
 def temporal_analyze(still, clip, idx, g_on, pc_on, *vals):
-    """Run the live pipeline over the current frame + next 5; report flicker."""
     if clip is None or len(clip) == 0:
         return None, None, "Extract a video clip in Tab 0 first.", None
-    i0 = int(np.clip(idx, 0, len(clip) - 1))
-    sel = clip[i0:i0 + TEMPORAL_N]
-    n = len(sel)
+    start = int(np.clip(idx, 0, len(clip) - 1))
+    window = clip[start:start + TEMPORAL_N]
+    n = len(window)
     if n < 2:
-        return None, None, (f"Frame {i0} is too close to the clip end "
+        return None, None, (f"Frame {start} is too close to the clip end "
                             f"({n} frame(s)); pick an earlier start frame."), None
     green, purple = split(vals)
-    src, greens, finals, ga, pa = [], [], [], [], []
-    for fr in sel:
+    sources, green_frames, final_frames, green_alphas, purple_alphas = [], [], [], [], []
+    for frame in window:
         if g_on:
-            gcast = alg.green_cast(fr, **green); gout, galpha = gcast.image, gcast.alpha
+            gcast = alg.green_cast(frame, **green); gout, galpha = gcast.image, gcast.alpha
         else:
-            gout, galpha = fr, np.zeros(fr.shape[:2], np.float32)
+            gout, galpha = frame, np.zeros(frame.shape[:2], np.float32)
         if pc_on:
             pcast = alg.purple_cast(gout, **purple); pout, palpha = pcast.image, pcast.alpha
         else:
             pout, palpha = gout, np.zeros(np.asarray(gout).shape[:2], np.float32)
-        src.append(np.asarray(fr, np.float32)); greens.append(np.asarray(gout, np.float32))
-        finals.append(np.asarray(pout, np.float32)); ga.append(galpha); pa.append(palpha)
+        sources.append(np.asarray(frame, np.float32))
+        green_frames.append(np.asarray(gout, np.float32))
+        final_frames.append(np.asarray(pout, np.float32))
+        green_alphas.append(galpha); purple_alphas.append(palpha)
 
-    gm = _stage_metrics(greens, src, ga, n)
-    pm = _stage_metrics(finals, greens, pa, n)
-    d_in = float(np.mean([np.abs(src[i] - src[i-1]).mean() for i in range(1, n)]))
+    green_metrics = _stage_metrics(green_frames, sources, green_alphas, n)
+    purple_metrics = _stage_metrics(final_frames, green_frames, purple_alphas, n)
+    input_motion = float(np.mean([np.abs(sources[i] - sources[i - 1]).mean() for i in range(1, n)]))
 
-    # heatmap: per-pixel temporal std of the final correction, isolating
-    # algorithm-induced flicker from real scene motion.
-    corr = np.stack([finals[i] - src[i] for i in range(n)], 0)
-    fmap = corr.std(0).mean(-1)
-    fmax = float(fmap.max())
-    heat = (cm.turbo(np.clip(fmap / (fmax + 1e-6), 0, 1))[..., :3] * 255).astype(np.uint8)
+    corrections = np.stack([final_frames[i] - sources[i] for i in range(n)], 0)
+    flicker = corrections.std(0).mean(-1)
+    peak = float(flicker.max())
+    heatmap = (cm.turbo(np.clip(flicker / (peak + 1e-6), 0, 1))[..., :3] * 255).astype(np.uint8)
 
-    plot = _pair_plot(gm["per_pair"], pm["per_pair"], i0)
-    gallery = [(finals[k].astype(np.uint8), f"frame {i0 + k}") for k in range(n)]
+    plot = _pair_plot(green_metrics["per_pair"], purple_metrics["per_pair"], start)
+    gallery = [(final_frames[k].astype(np.uint8), f"frame {start + k}") for k in range(n)]
     stats = (
-        f"**Frames {i0}–{i0+n-1}** ({n} frames) · input motion baseline **{d_in:.2f}**/255\n\n"
+        f"**Frames {start}–{start+n-1}** ({n} frames) · input motion baseline **{input_motion:.2f}**/255\n\n"
         f"| stage | static-flicker | Δalpha | toggle % | coverage % |\n"
         f"|---|---|---|---|---|\n"
-        f"| green | {gm['static']:.3f} | {gm['dalpha']:.3f} | {gm['toggle']:.2f} | {gm['cov']:.2f} |\n"
-        f"| purple | {pm['static']:.3f} | {pm['dalpha']:.3f} | {pm['toggle']:.2f} | {pm['cov']:.2f} |\n\n"
+        f"| green | {green_metrics['static']:.3f} | {green_metrics['dalpha']:.3f} | {green_metrics['toggle']:.2f} | {green_metrics['cov']:.2f} |\n"
+        f"| purple | {purple_metrics['static']:.3f} | {purple_metrics['dalpha']:.3f} | {purple_metrics['toggle']:.2f} | {purple_metrics['cov']:.2f} |\n\n"
         f"*static-flicker* = correction jump where the input barely moved (the cleanest "
         f"flicker signal); *Δalpha* = mean per-frame alpha change on corrected pixels; "
         f"*toggle* = % of frame flipping in/out of correction per pair. "
-        f"Heatmap = temporal std of the final correction (peak **{fmax:.1f}**/255; "
+        f"Heatmap = temporal std of the final correction (peak **{peak:.1f}**/255; "
         f"turbo: blue = stable, red = flickering)."
     )
-    return heat, plot, stats, gallery
+    return heatmap, plot, stats, gallery
 
 
 def export_onnx(still, clip, idx, g_on, pc_on, *vals, progress=gr.Progress()):
-    """Export the green->purple pipeline to ONNX (opset 17) from the live settings;
-    a disabled pass is baked as a no-op via max_opacity=0."""
     progress(0.05, desc="loading torch...")
     try:
         import torch
@@ -244,12 +229,9 @@ def export_onnx(still, clip, idx, g_on, pc_on, *vals, progress=gr.Progress()):
         return f"⚠️ torch not available — try `uv sync` to reinstall deps.\n\n`{e}`"
     green, purple = split(vals)
     if not g_on:
-        green["max_opacity"] = 0.0
+        green["max_opacity"] = 0.0          # a disabled pass bakes as a no-op
     if not pc_on:
         purple["max_opacity"] = 0.0
-    # Geometry is resolution-relative; the model bakes kernels for a reference size but resamples
-    # to it internally, so the export is resolution-invariant (exact at the reference, near-exact
-    # elsewhere). Use the frame you're tuning on as that reference (falls back to 1080p).
     frame = current_frame(still, clip, idx)
     ref_hw = tuple(np.asarray(frame).shape[:2]) if frame is not None else (1080, 1920)
     progress(0.3, desc=f"building model for {ref_hw[1]}x{ref_hw[0]}...")
@@ -269,19 +251,17 @@ def export_onnx(still, clip, idx, g_on, pc_on, *vals, progress=gr.Progress()):
 
 
 def _run_clip(sess, clip, fps, progress):
-    n, B, outs = len(clip), 4, []
-    for i in progress.tqdm(range(0, n, B), desc="ONNX defringe"):
-        outs.append(sess.run(None, {"rgb": np.ascontiguousarray(clip[i:i + B])})[0])
-    frames = np.concatenate(outs, 0)
+    batch, outputs = 4, []
+    for i in progress.tqdm(range(0, len(clip), batch), desc="ONNX defringe"):
+        outputs.append(sess.run(None, {"rgb": np.ascontiguousarray(clip[i:i + batch])})[0])
+    frames = np.concatenate(outputs, 0)
     h, w = frames.shape[1:3]
     with video_io.encoder(w, h, fps, ONNX_PREVIEW) as enc:
         video_io.write_frames(enc, frames)
-    return ONNX_PREVIEW, f"✅ {n} frames @ {fps:.0f}fps → video below ({w}×{h})."
+    return ONNX_PREVIEW, f"✅ {len(clip)} frames @ {fps:.0f}fps → video below ({w}×{h})."
 
 
 def _run_video(sess, video_path, progress):
-    """Stream the whole file through ONNX: ffmpeg-decode -> batched inference -> ffmpeg-encode,
-    so a 10-minute source never has to fit in memory."""
     w, h, nb, fps = video_io.probe(video_path)
     done = 0
     with video_io.encoder(w, h, fps or 25.0, ONNX_PREVIEW) as enc:
@@ -294,8 +274,6 @@ def _run_video(sess, video_path, progress):
 
 
 def run_onnx(clip, fps, video_path, scope, progress=gr.Progress()):
-    """Run the exported ONNX over the selected clip or the whole video, on the highest
-    compatible device. Returns (video, status, device-widget-update)."""
     if not os.path.exists(ONNX_PATH):
         return None, "Press **Export ONNX** first.", gr.update()
     try:
@@ -312,10 +290,6 @@ def run_onnx(clip, fps, video_path, scope, progress=gr.Progress()):
     return (*_run_clip(sess, clip, fps, progress), dev)
 
 
-# Frontend assets live in assets/ (co-located JS/CSS). defringe_wheel.js is the host-agnostic
-# colour-wheel web component; gradio_ui.js is the Gradio binding + load-time DOM glue (mount,
-# reset hijack, collapsibles, profile redraw); acc.css styles the collapsibles. The wheel must
-# load first (gradio_ui.js mounts it), so both are injected into <head> in that order.
 ASSETS = Path(__file__).with_name("assets")
 WHEEL_JS = (ASSETS / "defringe_wheel.js").read_text()
 GRADIO_UI_JS = (ASSETS / "gradio_ui.js").read_text()
@@ -323,9 +297,6 @@ ACC_CSS = (ASSETS / "acc.css").read_text()
 
 
 def acc_head(title, target):
-    """Header for a custom CSS collapsible whose body is `#target` (a `.acc-body` column).
-    Unlike gr.Accordion it never unmounts its body, so wheel-bound sliders stay readable.
-    Styled (acc.css) to match gr.Accordion's header exactly."""
     return gr.HTML(f'<div class="acc-head" data-target="{target}">'
                    f'<span>{title}</span><span class="chev">▼</span></div>')
 
@@ -341,13 +312,13 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 load_prof_btn = gr.UploadButton("📂 Load Profile", file_types=[".json"], type="filepath", size="sm", min_width=96)
                 restart_btn = gr.Button("↻ Restart app", size="sm", min_width=96)
             save_def_stat = gr.Markdown("")
-    # CSS-hidden, NOT visible=False: Gradio 6 unmounts invisible components, and gradio_ui.js's
-    # reset hijack (+ the wheel's reset) read window.__defaults / this element from the DOM.
+    # CSS-hidden, NOT visible=False: Gradio 6 unmounts invisible components, and the JS reads
+    # window.__defaults / this element from the DOM.
     defaults_blob = gr.Textbox(elem_id="defaults_blob", elem_classes="hidden-blob")
-    clip_state = gr.State(None)     # extracted video clip (frames)
-    still_state = gr.State(None)    # uploaded image (when the source is a still)
-    video_state = gr.State(None)    # uploaded video path (for seek/extract)
-    fps_state = gr.State(25.0)      # the extracted clip's fps (for ONNX re-encode)
+    clip_state = gr.State(None)
+    still_state = gr.State(None)
+    video_state = gr.State(None)
+    fps_state = gr.State(25.0)
 
     with gr.Tab("0 · Source"):
         gr.Markdown("Upload an **image** to tune on directly, or a **video** to seek into and "
@@ -373,41 +344,35 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 green_wheel = gr.HTML("<div class='defringe-wheel-mount'></div>")
                 gr.Markdown("<div style='text-align:center'><sub>Drag any handle to adjust — the sliders below "
                             "mirror it.</sub></div>")
-                # Caster/shadow hue+chroma are driven by the wheel above, which reads & writes
-                # these sliders' DOM inputs — so they must stay mounted. A gr.Accordion unmounts
-                # its body when closed (blanking the wheel), so these use a custom CSS collapsible
-                # (acc_head + acc-body): collapsing just sets display:none, keeping them in the DOM.
+                # Custom CSS collapsible, not gr.Accordion: a gr.Accordion unmounts its body when
+                # closed, which blanks the wheel-bound sliders. display:none keeps them in the DOM.
                 with gr.Column(elem_classes="gacc"):
                     acc_head("Casters (warm)", "acc-g-casters")
                     with gr.Column(elem_id="acc-g-casters", elem_classes="acc-body"):
-                        S(GREEN_REG, "caster_min_chroma", 0, 50, 0.5, "Minimum Chroma", "How saturated a warm source must be to count as a fringe-caster. Lower = more casters.")
-                        S(GREEN_REG, "caster_hue_lo", -90, 0, 1, "Hue Floor", "Low edge of the caster hue range; lower reaches toward purple.")
-                        S(GREEN_REG, "caster_hue_hi", 0, 90, 1, "Hue Ceiling", "High edge of the caster hue range; higher reaches toward orange.")
+                        gslider("caster_min_chroma")
+                        gslider("caster_hue_lo")
+                        gslider("caster_hue_hi")
                 with gr.Column(elem_classes="gacc"):
                     acc_head("Shadows (cool)", "acc-g-shadows")
                     with gr.Column(elem_id="acc-g-shadows", elem_classes="acc-body"):
-                        S(GREEN_REG, "fringe_min_chroma", 0, 30, 0.1, "Minimum Chroma", "How saturated a pixel must be to count as green fringe. Lower = catch fainter fringe.")
-                        S(GREEN_REG, "fringe_hue_lo", -140, 0, 1, "Hue Floor", "Low edge of the green-fringe hue range; lower reaches toward green/yellow.")
-                        S(GREEN_REG, "fringe_hue_hi", 0, 140, 1, "Hue Ceiling", "High edge of the green-fringe hue range; higher reaches toward blue/violet.")
-                # Size & Reach and Repair are now driven by the wheel's blobs too, so they also
-                # use the mounted custom collapsible (a gr.Accordion would unmount and blank them).
+                        gslider("fringe_min_chroma")
+                        gslider("fringe_hue_lo")
+                        gslider("fringe_hue_hi")
                 with gr.Column(elem_classes="gacc"):
                     acc_head("Size & Reach", "acc-g-size")
                     with gr.Column(elem_id="acc-g-size", elem_classes="acc-body"):
-                        S(GREEN_REG, "min_area", 0, 100, 0.5, "Minimum Area", "Ignore caster blobs smaller than this — ppm of frame area (resolution-independent).")
-                        S(GREEN_REG, "cast_radius", 0, 30, 0.1, "Cast Reach", "How far from a caster to look for its green fringe — ‰ of the frame diagonal.")
+                        gslider("min_area")
+                        gslider("cast_radius")
                 with gr.Column(elem_classes="gacc"):
                     acc_head("Repair", "acc-g-repair")
                     with gr.Column(elem_id="acc-g-repair", elem_classes="acc-body"):
-                        S(GREEN_REG, "max_opacity", 0, 1, 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive.")
-                        S(GREEN_REG, "repair_spread", 0, 5, 0.05, "Repair Spread", "Grow the corrected region outward before feathering — ‰ of the frame diagonal.")
-                        S(GREEN_REG, "feather", 0, 5, 0.05, "Feather", "Soften/blur the correction's edge — ‰ of the frame diagonal.")
+                        gslider("max_opacity")
+                        gslider("repair_spread")
+                        gslider("feather")
                 with gr.Accordion("Advanced", open=False):
-                    S(GREEN_REG, "area_softness", 0, 1, 0.05, "Area Softness", "Fade marginal-size casters in/out instead of popping — for temporal stability. 0 = hard cutoff.")
-                    S(GREEN_REG, "radius_softness", 0, 1, 0.05, "Reach Softness", "Fade the fringe out with distance instead of a hard edge — for temporal stability. 0 = hard cutoff.")
-                    S(GREEN_REG, "full_strength_span", 1, 30, 0.5, "Full-Strength Span", "Extra chroma above Minimum Chroma that reaches full correction. Wider = gentler.")
-                    S(GREEN_REG, "tone_correction_radius", 0, 25, 0.1, "Tone Correction Radius", "How far out to sample the clean colour fringe is pulled toward — ‰ of the frame diagonal.")
-                    S(GREEN_REG, "tone_directionality", 0, 1, 0.05, "Tone Directionality", "Pull repair colour from the cast side, not the caster. 0 = all directions, 1 = away from caster.")
+                    for _n in ("area_softness", "radius_softness", "full_strength_span",
+                               "tone_correction_radius", "tone_directionality"):
+                        gslider(_n)
             with gr.Column(scale=2):
                 t1_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", visible=False)
                 g_stat = gr.Textbox(label="stats", interactive=False)
@@ -425,37 +390,30 @@ with gr.Blocks(title="Defringe tuner") as demo:
                 purple_wheel = gr.HTML("<div class='defringe-wheel-mount'></div>")
                 gr.Markdown("<div style='text-align:center'><sub>Drag any handle to adjust — the sliders below "
                             "mirror it.</sub></div>")
-                # Every wheel-bound group must stay mounted so the wheel can read & write it, so all
-                # use the custom CSS collapsible (a gr.Accordion unmounts its body when closed, blanking
-                # the wheel). The source-highlight blob plays the caster: brightness = Minimum Lightness,
-                # radius = Minimum Area, ring = Cast Reach.
                 with gr.Column(elem_classes="gacc"):
                     acc_head("Source highlight (caster)", "acc-p-source")
                     with gr.Column(elem_id="acc-p-source", elem_classes="acc-body"):
-                        S(PURPLE_REG, "caster_min_lightness", 50, 100, 1, "Minimum Lightness", "How bright a highlight must be to count as a fringe-caster.")
-                        S(PURPLE_REG, "min_area", 0, 150, 0.5, "Minimum Area", "Ignore highlight blobs smaller than this — ppm of frame area (resolution-independent).")
-                        S(PURPLE_REG, "cast_radius", 0, 30, 0.1, "Cast Reach", "How far from a highlight to look for its magenta fringe — ‰ of the frame diagonal.")
+                        pslider("caster_min_lightness")
+                        pslider("min_area")
+                        pslider("cast_radius")
                 with gr.Column(elem_classes="gacc"):
                     acc_head("Shadows (magenta)", "acc-p-shadows")
                     with gr.Column(elem_id="acc-p-shadows", elem_classes="acc-body"):
                         gr.Markdown("<sub>a magenta *excess* over the scene's overall lighting tone</sub>")
-                        S(PURPLE_REG, "fringe_min_chroma", 0, 15, 0.1, "Minimum Chroma", "Chroma floor — pixels below this are never flagged (noise rejection).")
-                        S(PURPLE_REG, "target_hue", -45, 45, 1, "Target Hue", "Shift the detected fringe colour: 0 = magenta, higher = toward red, lower = toward violet/blue.")
-                        S(PURPLE_REG, "excess_thresh", 0, 20, 0.5, "Excess Threshold", "How much more magenta than the scene's overall tone a pixel must be to count as fringe. Higher = stricter.")
-                        S(PURPLE_REG, "hue_halfwidth", 5, 90, 1, "Hue Range (±°)", "How wide a band of hues around Target Hue counts as fringe. 90 = essentially no limit; lower narrows it to colours nearer the target.")
+                        pslider("fringe_min_chroma")
+                        pslider("target_hue")
+                        pslider("excess_thresh")
+                        pslider("hue_halfwidth")
                 with gr.Column(elem_classes="gacc"):
                     acc_head("Repair", "acc-p-repair")
                     with gr.Column(elem_id="acc-p-repair", elem_classes="acc-body"):
-                        S(PURPLE_REG, "max_opacity", 0, 1, 0.05, "Maximum Strength", "Cap on correction opacity. Higher = more aggressive.")
-                        S(PURPLE_REG, "repair_spread", 0, 5, 0.05, "Repair Spread", "Grow the corrected region outward before feathering — ‰ of the frame diagonal.")
-                        S(PURPLE_REG, "feather", 0, 5, 0.05, "Feather", "Soften/blur the correction's edge — ‰ of the frame diagonal.")
+                        pslider("max_opacity")
+                        pslider("repair_spread")
+                        pslider("feather")
                 with gr.Accordion("Advanced", open=False):
-                    S(PURPLE_REG, "area_softness", 0, 1, 0.05, "Area Softness", "Fade marginal highlights in/out instead of popping — for temporal stability. 0 = hard cutoff.")
-                    S(PURPLE_REG, "radius_softness", 0, 1, 0.05, "Reach Softness", "Fade the fringe out with distance instead of a hard edge — for temporal stability. 0 = hard cutoff.")
-                    S(PURPLE_REG, "hue_softness", 0, 45, 1, "Hue Range Softness", "Feather (°) on the Hue Range edge — ramp the cutoff instead of a hard boundary, for temporal stability. 0 = hard edge.")
-                    S(PURPLE_REG, "full_strength_span", 1, 30, 0.5, "Full-Strength Span", "Extra excess above the threshold that reaches full correction. Wider = gentler.")
-                    S(PURPLE_REG, "tone_correction_radius", 0, 25, 0.1, "Tone Correction Radius", "How far out to sample the clean colour fringe is pulled toward — ‰ of the frame diagonal.")
-                    S(PURPLE_REG, "tone_directionality", 0, 1, 0.05, "Tone Directionality", "Pull repair colour from the fringe side, not the highlight. 0 = all directions, 1 = away from highlight.")
+                    for _n in ("area_softness", "radius_softness", "hue_softness",
+                               "full_strength_span", "tone_correction_radius", "tone_directionality"):
+                        pslider(_n)
             with gr.Column(scale=2):
                 t2_frame = gr.Slider(0, 249, value=0, step=1, label="frame (within clip)", visible=False)
                 pc_stat = gr.Textbox(label="stats", interactive=False)
@@ -494,7 +452,6 @@ with gr.Blocks(title="Defringe tuner") as demo:
                                          interactive=False, max_lines=1)
                 onnx_video = gr.Video(label="ONNX output", height=420)
 
-    # REGs are fully built now, so each wheel's slider element IDs resolve.
     green_wheel.value = f"<div class='defringe-wheel-mount' data-config='{views.green_wheel_config(GREEN_REG)}'></div>"
     purple_wheel.value = f"<div class='defringe-wheel-mount' data-config='{views.purple_wheel_config(PURPLE_REG)}'></div>"
 
@@ -504,7 +461,8 @@ with gr.Blocks(title="Defringe tuner") as demo:
             pc_compare, pc_detect, pc_stat]
 
     for c in ins:
-        (c.release if isinstance(c, gr.Slider) else c.change)(run_chain, ins, outs)
+        on_change = c.release if isinstance(c, gr.Slider) else c.change
+        on_change(run_chain, ins, outs)
 
     upload_outs = [still_state, clip_state, video_state, t0_info, t0_seekimg, t0_preview,
                    t0_seek, t0_secs, t0_extract, t1_frame, t2_frame, t3_frame,
@@ -517,8 +475,7 @@ with gr.Blocks(title="Defringe tuner") as demo:
               .then(run_chain, ins, outs)
     t0_frame.change(pick_preview, [still_state, clip_state, t0_frame], [t0_preview])
 
-    # Frame scrubber mirrored into tabs 1/2/3. .release is user-only, so propagating a
-    # value never re-triggers — no sync loop. run_chain reads the frame from t0_frame.
+    # mirror_frame uses .release (user-only), so propagating a value never re-triggers — no sync loop.
     t0_frame.release(mirror_frame, [t0_frame], [t1_frame, t2_frame, t3_frame])
     t1_frame.release(mirror_frame, [t1_frame], [t0_frame, t2_frame, t3_frame]).then(run_chain, ins, outs)
     t2_frame.release(mirror_frame, [t2_frame], [t0_frame, t1_frame, t3_frame]).then(run_chain, ins, outs)
@@ -529,13 +486,9 @@ with gr.Blocks(title="Defringe tuner") as demo:
     onnx_run_btn.click(run_onnx, [clip_state, fps_state, video_state, onnx_scope],
                        [onnx_video, onnx_run_stat, onnx_device])
 
-    # Seed the reset blob with the constructed values so reset is correct from first
-    # load; on save, refresh window.__defaults so reset retargets without a restart.
     reg_comps = [c["comp"] for c in REG]
     defaults_blob.value = json.dumps({c["elem_id"]: c["comp"].value for c in REG})
     save_prof_btn.click(export_profile, reg_comps, save_prof_btn)
-    # Load: apply to sliders + persist as active profile, then retarget reset / redraw the wheels,
-    # then re-run the pipeline with the loaded values.
     load_prof_btn.upload(import_profile, [load_prof_btn], reg_comps + [defaults_blob, save_def_stat]) \
                  .then(None, defaults_blob, None, js="(b) => applyProfileDefaults(b)") \
                  .then(run_chain, ins, outs)

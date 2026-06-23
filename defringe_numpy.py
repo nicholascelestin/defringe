@@ -1,247 +1,193 @@
-"""Green/purple fringe removal in CIELAB. Both passes share one casting-shadow model
--- find the caster source, find its nearby chroma fringe, pull that chroma to the clean
-local tone -- and differ only in how they define caster/fringe/strength (shared back
-end: cast_defringe). Chain green-first; purple fringe can itself cast green fringe.
-
-    out = defringe(rgb)                       # the canonical green->purple pipeline
-    cast = green_cast(rgb); cast.image, cast.alpha   # one pass, with detection detail
-"""
 from dataclasses import dataclass
 
 import numpy as np
+from numpy.typing import NDArray
 from skimage.color import rgb2lab, lab2rgb
 from scipy.ndimage import gaussian_filter, maximum_filter, uniform_filter
 
 import geometry
+from parameters import GREEN_DEFAULTS, PURPLE_DEFAULTS
 
-__all__ = ["defringe", "green_cast", "purple_cast", "cast_defringe", "Cast",
-           "GREEN_CAST", "PURPLE_CAST", "RED_REF", "GREEN_REF", "MAGENTA_REF"]
+__all__ = ["defringe", "green_cast", "purple_cast", "Cast",
+           "RED_REF", "GREEN_REF", "MAGENTA_REF"]
+
+RED_REF, GREEN_REF, MAGENTA_REF = 5.0, 200.0, 315.0
+KEPT_WEIGHT = 0.5
+TRUST_FLOOR = 1e-3
+NEGLIGIBLE_REACH = 1e-3
 
 
 @dataclass(frozen=True)
 class Cast:
-    """One pass's result: the corrected frame plus the detection it acted on.
-    `caster` is what survived the area test; `caster_raw` is the raw detection."""
-    image: np.ndarray       # corrected uint8 RGB (untouched pixels bit-exact)
-    alpha: np.ndarray       # per-pixel correction opacity in [0, max_opacity]
-    caster: np.ndarray      # casters that passed the Minimum-Area test (bool)
-    caster_raw: np.ndarray  # raw caster detection, pre-area (bool)
+    image: NDArray[np.uint8]
+    alpha: NDArray[np.float32]
+    casters_kept: NDArray[np.bool_]
+    casters_found: NDArray[np.bool_]
 
 
 def defringe(rgb, green=None, purple=None):
-    """Canonical pipeline: green fringe first (purple fringe can itself cast green, so
-    removing purple first would orphan it), then purple. -> corrected uint8 RGB."""
-    g = green_cast(rgb, **(green or {}))
-    return purple_cast(g.image, **(purple or {})).image
+    # Green first: purple fringe can itself cast green fringe, so removing purple first would
+    # orphan that green fringe (no caster left near it) and leave it uncorrectable.
+    green, purple = green or {}, purple or {}
+    cleaned = green_cast(rgb, **green)
+    return purple_cast(cleaned.image, **purple).image
 
 
-# ── colour-space + shared helpers ────────────────────────────────────────────
+def green_cast(rgb, **kw):
+    p = {**GREEN_DEFAULTS, **kw}
+    src = np.asarray(rgb, np.float32)
+    lab = rgb_to_lab(src)
+    a, b = lab[..., 1], lab[..., 2]
+    hue, chroma = to_polar(a, b)
+    casters = (chroma > p["caster_min_chroma"]) & in_band(signed_hue_offset(hue, RED_REF), p["caster_hue_lo"], p["caster_hue_hi"])
+    fringe = (chroma > p["fringe_min_chroma"]) & in_band(signed_hue_offset(hue, GREEN_REF), p["fringe_hue_lo"], p["fringe_hue_hi"])
+    strength = ramp(chroma, p["fringe_min_chroma"], p["full_strength_span"])
+    return _cast_defringe(src, lab, casters, fringe, strength, p)
+
+
+def purple_cast(rgb, **kw):
+    p = {**PURPLE_DEFAULTS, **kw}
+    src = np.asarray(rgb, np.float32)
+    lab = rgb_to_lab(src)
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    _, chroma = to_polar(a, b)
+    casters = L > p["caster_min_lightness"]
+    scene_a, scene_b = scene_tone(L, a, b, p["caster_min_lightness"])
+    excess_a, excess_b = a - scene_a, b - scene_b
+    excess = np.hypot(excess_a, excess_b)
+    off_target = angle_from_axis(excess_a, excess_b, np.radians(MAGENTA_REF + p["target_hue"]))
+    within_cone = soft_step(-off_target, -(p["hue_halfwidth"] + 1e-6), p["hue_softness"])
+    fringe = (chroma > p["fringe_min_chroma"]) & (excess > p["excess_thresh"]) & (within_cone > 0)
+    strength = ramp(excess, p["excess_thresh"], p["full_strength_span"]) * within_cone
+    return _cast_defringe(src, lab, casters, fringe, strength, p)
+
+
+# ── casting-shadow engine ────────────────────────────────────────────────────
+
+def _cast_defringe(src, lab, casters, fringe, strength, p):
+    geom = geometry.relative_to_px(p, *lab.shape[:2])
+    caster_field = survive_min_area(casters, geom["min_area"], p["area_softness"])
+    casters_kept = caster_field > KEPT_WEIGHT
+    reach = cast_reach(caster_field, geom["cast_radius"], p["radius_softness"])
+    reachable = (reach > NEGLIGIBLE_REACH) & ~casters_kept
+    shadow = (fringe & reachable).astype(np.float32) * reach
+    alpha = feathered_alpha(shadow * strength, geom["repair_spread"], geom["feather"], p["max_opacity"])
+    image = repair_chroma(src, lab, alpha, reach, geom["tone_correction_radius"], p["tone_directionality"])
+    return Cast(image, alpha, casters_kept, casters)
+
+
+def survive_min_area(casters, min_area, softness):
+    casters = casters.astype(np.float32)
+    window = geometry.area_window(min_area)
+    neighbours = uniform_filter(casters, window) * float(window * window)
+    return casters * soft_step(neighbours, min_area - 0.5, max(softness, 1e-6) * min_area)
+
+
+def cast_reach(caster_field, reach_px, softness):
+    radius = max(1, round(reach_px * geometry.REACH_CALIB))
+    blur = max(softness * reach_px * geometry.REACH_FEATHER_CALIB, 1e-3)
+    dilated = maximum_filter(caster_field, size=2 * radius + 1)
+    return np.clip(gaussian_filter(dilated, blur), 0.0, 1.0)
+
+
+def grow_region(field, radius_px):
+    radius = round(radius_px)
+    return maximum_filter(field, size=2 * radius + 1)
+
+
+def feathered_alpha(seed, spread_px, feather_px, max_opacity):
+    grown = grow_region(seed, spread_px)
+    return np.clip(gaussian_filter(grown, feather_px), 0.0, max_opacity)
+
+
+def tone_trust(alpha, reach_weight, directionality):
+    donor = (1.0 - directionality * reach_weight).astype(np.float32)
+    return ((1 - alpha) + TRUST_FLOOR) * donor
+
+
+def repair_chroma(src, lab, alpha, reach_weight, tone_radius, directionality):
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    trust = tone_trust(alpha, reach_weight, directionality)
+    tone_a, tone_b = local_tone(a, b, trust, tone_radius)
+    corrected = np.stack([L, lerp(a, tone_a, alpha), lerp(b, tone_b, alpha)], -1)
+    return composite(lab_to_rgb(corrected), src, alpha)
+
+
+# ── trust-weighted tone ──────────────────────────────────────────────────────
+
+def local_tone(a, b, trust, sigma):
+    trust_blurred = gaussian_filter(trust, sigma)
+    return (trust_weighted_blur(a, trust, sigma, trust_blurred),
+            trust_weighted_blur(b, trust, sigma, trust_blurred))
+
+
+def trust_weighted_blur(signal, trust, sigma, trust_blurred=None):
+    if trust_blurred is None:
+        trust_blurred = gaussian_filter(trust, sigma)
+    return safe_divide(gaussian_filter(signal * trust, sigma), trust_blurred)
+
+
+def scene_tone(L, a, b, blown):
+    lit = L * (L < blown)
+    weight = lit.sum()
+    return safe_divide((lit * a).sum(), weight), safe_divide((lit * b).sum(), weight)
+
+
+# ── maths ────────────────────────────────────────────────────────────────────
+
+def soft_step(x, threshold, width):
+    if width <= 0:
+        return (x > threshold).astype(np.float32)
+    width = np.float64(width)
+    return smoothstep(threshold - width, threshold + width, x).astype(np.float32)
+
+
+def smoothstep(lo, hi, x):
+    t = np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def lerp(start, end, t):
+    return start + t * (end - start)
+
+
+def ramp(value, threshold, span):
+    return np.clip((value - threshold) / max(span, 1e-3), 0.0, 1.0)
+
+
+def in_band(x, lo, hi):
+    return (x >= lo) & (x <= hi)
+
+
+def signed_hue_offset(hue, reference):
+    return ((hue - reference + 180.0) % 360.0) - 180.0
+
+
+def angle_from_axis(vec_a, vec_b, axis_rad):
+    axis_a, axis_b = np.cos(axis_rad), np.sin(axis_rad)
+    along = vec_a * axis_a + vec_b * axis_b
+    across = -vec_a * axis_b + vec_b * axis_a
+    return np.degrees(np.arctan2(np.abs(across), along))
+
+
+def safe_divide(numerator, denominator):
+    return numerator / (denominator + 1e-6)
+
+
+# ── colour ───────────────────────────────────────────────────────────────────
 
 def rgb_to_lab(rgb_u8):
-    """RGB uint8 (or float 0-255) -> CIELAB float."""
     return rgb2lab(np.asarray(rgb_u8, np.float32) / 255.0)
 
 
 def lab_to_rgb(lab):
-    """CIELAB float -> RGB float 0-255 (clipped, not yet uint8)."""
     return np.clip(lab2rgb(lab) * 255.0, 0, 255)
 
 
-def composite(out_float, src_float, alpha):
-    """Carry untouched pixels (alpha == 0) through bit-exact; -> uint8."""
-    return np.where((alpha > 0)[..., None], out_float, src_float).astype(np.uint8)
+def to_polar(a, b):
+    return np.degrees(np.arctan2(b, a)) % 360.0, np.hypot(a, b)
 
 
-def soft_step(x, thr, width):
-    """Soft, temporally stable stand-in for `x > thr` -> float32 in [0, 1];
-    width <= 0 falls back to the exact hard comparison."""
-    x = np.asarray(x)
-    width = np.asarray(width, np.float64)
-    hard_step = x > thr
-    # The clamp pins smoothstep to exactly 0/1 outside the band, so untouched pixels
-    # stay at literal 0 for the bit-exact alpha==0 passthrough downstream.
-    half_width = np.where(width > 0, width, 1.0)          # dummy where hard; avoids /0
-    low, high = thr - half_width, thr + half_width
-    t = np.clip((x - low) / (high - low), 0.0, 1.0)
-    smoothstep = t * t * (3.0 - 2.0 * t)
-    # float32, not float64: a wider weight would upcast the downstream Lab blurs.
-    return np.where(width > 0, smoothstep, hard_step).astype(np.float32)
-
-
-def normconv(signal, weight, sigma, denom=None):
-    """Trust-weighted blur: blur(signal*weight) / blur(weight). `denom` shares one
-    weight-blur across channels with the same `weight`."""
-    if denom is None:
-        denom = gaussian_filter(weight, sigma) + 1e-6
-    return gaussian_filter(signal * weight, sigma) / denom
-
-
-def local_tone(a, b, trust, sigma):
-    """Trust-weighted local mean of the two chroma channels (the clean tone fringe is
-    pulled toward); the shared `trust` lets one denominator blur serve both."""
-    den = gaussian_filter(trust, sigma) + 1e-6
-    return normconv(a, trust, sigma, den), normconv(b, trust, sigma, den)
-
-
-# ── shared casting-shadow engine ─────────────────────────────────────────────
-
-def cast_defringe(src, lab, caster, fringe, strength, p):
-    """Shared back end: gate `fringe` by reach to a nearby `caster`, build a feathered
-    alpha from `strength`, pull chroma to the trusted local tone (L kept).
-    -> Cast; untouched pixels (alpha == 0) bit-exact.
-
-    Geometry is scale-space and resolution-relative: the spatial params arrive as
-    fractions of the frame and convert to px from the frame's own size, so a setting
-    transfers across resolutions. `min_area` is ppm of frame AREA; `cast_radius`,
-    `feather`, `repair_spread`, `tone_correction_radius` are per-mille of the DIAGONAL.
-    The area test is a box-sum count + soft threshold (not connected components) and the
-    reach is a square dilation + gaussian feather (not a Euclidean distance transform) --
-    both linear/local, so the ONNX port matches and resolution scaling is exact.
-    caster_raw is the raw detection; caster is what survived the area test."""
-    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
-    H, W = L.shape
-    px = geometry.relative_to_px(p, H, W)
-    min_area = px["min_area"]                                    # ppm of area  -> px^2
-    reach = px["cast_radius"]                                    # per-mille of diagonal -> px
-    feather = px["feather"]
-    spread = px["repair_spread"]
-    tone_radius = px["tone_correction_radius"]
-
-    cf = caster.astype(np.float32)
-    # Minimum Area as a local bright-pixel count (box-sum), soft-thresholded into a
-    # continuous per-pixel caster weight -- marginal-size casters ramp in, not pop.
-    wa = geometry.area_window(min_area)
-    count = uniform_filter(cf, wa) * float(wa * wa)
-    caster_w = cf * soft_step(count, min_area - 0.5, max(p["area_softness"], 1e-6) * min_area)
-    caster_mask = caster_w > 0.5
-
-    # Cast Reach as a square dilation of the kept-caster field (which carries the area
-    # weight) plus a gaussian feather; 0.8/0.4 calibrate the square footprint to the
-    # former Euclidean reach. reach_weight ~ 1 over caster + reach, decaying outward.
-    R = max(1, int(round(reach * geometry.REACH_CALIB)))
-    reach_weight = np.clip(gaussian_filter(maximum_filter(caster_w, size=2 * R + 1),
-                                           max(p["radius_softness"] * reach * geometry.REACH_FEATHER_CALIB, 1e-3)), 0, 1)
-    candidate = fringe & (reach_weight > 1e-3) & (~caster_mask)
-    shadow_strength = candidate.astype(np.float32) * reach_weight
-    donor = np.ones(L.shape, np.float32)
-    if p["tone_directionality"] > 0:                            # bias tone donors off the caster side
-        donor = (1.0 - p["tone_directionality"] * reach_weight).astype(np.float32)
-
-    alpha_seed = shadow_strength * strength
-    sp = int(round(spread))
-    if sp > 0:
-        alpha_seed = maximum_filter(alpha_seed, size=2 * sp + 1)
-    alpha = np.clip(gaussian_filter(alpha_seed, feather), 0, p["max_opacity"])
-    # 1e-3 keeps faint trust everywhere so corrected regions still get a tone estimate
-    trust = ((1 - alpha) + 1e-3) * donor
-    tone_a, tone_b = local_tone(a, b, trust, tone_radius)
-    out = lab_to_rgb(np.stack([L, a + alpha * (tone_a - a), b + alpha * (tone_b - b)], -1))
-    out = composite(out, src, alpha)
-    return Cast(image=out, alpha=alpha, caster=caster_mask, caster_raw=caster)
-
-
-# ── green pass ───────────────────────────────────────────────────────────────
-
-RED_REF, GREEN_REF = 5.0, 200.0
-
-GREEN_CAST = dict(
-    caster_min_chroma=21.0,
-    # Hue bands are signed-degree offsets from a reference hue (RED_REF / GREEN_REF),
-    # which sidesteps red's 0/360 wraparound; negative = toward purple, positive = orange.
-    caster_hue_lo=-54.0,
-    caster_hue_hi=23.0,
-    fringe_hue_lo=-80.0,
-    fringe_hue_hi=90.0,
-    fringe_min_chroma=4.5,
-    # Spatial knobs are resolution-relative (see cast_defringe): cast_radius/feather/
-    # repair_spread/tone_correction_radius are per-mille of the diagonal; min_area is
-    # ppm of frame area. Values below are the former 1080p pixel defaults, converted.
-    cast_radius=4.0,              # ‰ of diagonal
-    min_area=10.0,                # ppm of frame area
-    full_strength_span=9.5,
-    max_opacity=0.7,
-    repair_spread=0.45,           # was 1 px
-    feather=0.91,                 # was 2 px
-    tone_correction_radius=7.26,  # was 16 px
-    # *_softness: soft-step ramp width as a fraction of the matching threshold.
-    area_softness=0.4,
-    radius_softness=0.4,
-    tone_directionality=0.5,
-)
-
-
-def green_cast(rgb, **kw):
-    """Remove green fringe cast by saturated red/purple sources. -> Cast."""
-    p = {**GREEN_CAST, **kw}
-    src = np.asarray(rgb, np.float32)
-    lab = rgb_to_lab(src)
-    a, b = lab[..., 1], lab[..., 2]
-    hue = np.degrees(np.arctan2(b, a)) % 360.0
-    chroma = np.hypot(a, b)
-    hue_from_red = ((hue - RED_REF + 180.0) % 360.0) - 180.0
-    hue_from_green = ((hue - GREEN_REF + 180.0) % 360.0) - 180.0
-
-    caster = (chroma > p["caster_min_chroma"]) & (hue_from_red >= p["caster_hue_lo"]) & (hue_from_red <= p["caster_hue_hi"])
-    fringe = (chroma > p["fringe_min_chroma"]) & (hue_from_green >= p["fringe_hue_lo"]) & (hue_from_green <= p["fringe_hue_hi"])
-    strength = np.clip((chroma - p["fringe_min_chroma"]) / max(p["full_strength_span"], 1e-3), 0, 1)
-    return cast_defringe(src, lab, caster, fringe, strength, p)
-
-
-# ── purple pass ──────────────────────────────────────────────────────────────
-
-MAGENTA_REF = 315.0   # magenta-violet; the fringe excess is measured along this hue
-
-PURPLE_CAST = dict(
-    caster_min_lightness=88.0,
-    fringe_min_chroma=6.8,
-    cast_radius=3.63,             # per-mille of diagonal (was 8 px @1080p); see cast_defringe
-    min_area=4.82,               # ppm of frame area      (was 10 px^2 @1080p)
-    full_strength_span=10.0,
-    max_opacity=0.85,
-    repair_spread=0.91,          # was 2 px
-    feather=0.91,                # was 2 px
-    tone_correction_radius=7.26, # was 16 px
-    # *_softness: soft-step ramp width as a fraction of the matching threshold.
-    area_softness=0.4,
-    radius_softness=0.4,
-    tone_directionality=0.7,
-    target_hue=-15.0,         # signed deg from magenta (315): 0 = magenta, + red, - violet
-    excess_thresh=16.0,
-    hue_halfwidth=90.0,       # +-deg accepted around target_hue; 90 ~ gate off
-    hue_softness=20.0,        # feather on that edge, in DEGREES (not a fraction)
-)
-
-
-def purple_cast(rgb, **kw):
-    """Remove purple fringe cast by blown highlights. -> Cast."""
-    p = {**PURPLE_CAST, **kw}
-    src = np.asarray(rgb, np.float32)
-    lab = rgb_to_lab(src)
-    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
-    chroma = np.hypot(a, b)
-
-    caster = L > p["caster_min_lightness"]
-
-    # Magenta fringe = an EXCESS over the scene's lighting tone (luminance-weighted mean
-    # of a/b over lit, non-blown pixels), not an absolute hue band -- so a warm-lit scene
-    # cancels its own warmth and only the blue-shifted fringe stands out.
-    target_angle = np.radians(MAGENTA_REF + p["target_hue"])
-    axis_a, axis_b = np.cos(target_angle), np.sin(target_angle)
-    lit_weight = L * (L < p["caster_min_lightness"])
-    weight_sum = float(lit_weight.sum()) + 1e-6
-    lighting_a = float((lit_weight * a).sum() / weight_sum)
-    lighting_b = float((lit_weight * b).sum() / weight_sum)
-    excess_a, excess_b = a - lighting_a, b - lighting_b
-    # Excess = RADIAL distance from the scene tone (any direction). The angular gate below
-    # restricts which direction counts, so this stays magenta-specific; within that hue cone
-    # it is equivalent to the old axis projection (excess_a*axis_a+excess_b*axis_b), and it
-    # matches the ambient-centred "excess over ambient" wheel (distance from centre = excess).
-    magenta_proj = excess_a * axis_a + excess_b * axis_b   # signed projection: used only for the angular gate
-    magenta_excess = np.hypot(excess_a, excess_b)
-    # angular gate on the excess vector, soft-edged so it doesn't flip frame to frame
-    off_axis = -excess_a * axis_b + excess_b * axis_a
-    off_axis_deg = np.degrees(np.arctan2(np.abs(off_axis), magenta_proj))
-    hue_weight = soft_step(-off_axis_deg, -(p["hue_halfwidth"] + 1e-6), p["hue_softness"])
-    fringe = (chroma > p["fringe_min_chroma"]) & (magenta_excess > p["excess_thresh"]) & (hue_weight > 0)
-    strength = np.clip((magenta_excess - p["excess_thresh"]) / max(p["full_strength_span"], 1e-3), 0, 1) * hue_weight
-    return cast_defringe(src, lab, caster, fringe, strength, p)
+def composite(corrected, original, alpha):
+    touched = (alpha > 0)[..., np.newaxis]
+    return np.where(touched, corrected, original).astype(np.uint8)

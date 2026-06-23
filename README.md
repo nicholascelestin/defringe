@@ -22,11 +22,13 @@ defringe_torch.py   torch/ONNX twin — tracks the numpy reference
 geometry.py         resolution-relative → pixel conversion + reach/area calibration,
                     shared by both twins so they can't drift
 app.py              Gradio tuner — layout + event wiring (controllers)
-params.py           the slider registry: defaults, persistence, profile import/export
+parameters.py       the tunable-parameter spec: one Param row per knob (name, default,
+                    range, label, help) — the single source the rest projects from
+sliders.py          builds a Gradio slider per spec; the registry, persistence, profiles
 views.py            detection overlays + colour-wheel config (presentation)
 video_io.py         ffmpeg wrappers: decode clips/frames, stream-decode, encode
 onnx_runtime.py     ONNX Runtime device selection + session building
-assets/             frontend: defringe_wheel.js, reset.js, accordion.js, acc.css
+assets/             frontend: defringe_wheel.js, gradio_ui.js, acc.css
 cast_defringe.onnx  exported model (uint8 RGB in/out, dynamic N/H/W)
 colab_defringe.ipynb  GPU runner: ONNX over a whole video, colour-correct encode
 tests/              numpy ↔ torch/ONNX conformance (mean/p99 tolerance)

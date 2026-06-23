@@ -1,30 +1,15 @@
-"""Torch/ONNX port of the green_cast -> purple_cast pipeline.
-
-Since the scale-space rewrite, defringe_numpy.py uses the SAME geometry as this port
--- a box-sum count for Minimum Area and a square dilation + gaussian feather for Cast
-Reach -- so the two now closely converge (no more label()/distance_transform_edt gap).
-The relative→px conversion and the reach/area calibration constants live in geometry.py,
-imported by both sides so they can't drift.
-
-Spatial params are resolution-relative; ONNX bakes kernel sizes as graph constants, so they're
-converted to px for a reference resolution (ref_hw, default 1080p) at construction. To stay
-resolution-invariant regardless, forward() resamples the frame to the reference diagonal, runs
-the pipeline, then resizes the correction *delta* back and applies it to the original -- so one
-exported model is geometrically correct at any input size (and bit-exact at the reference, where
-the resizes are no-ops). Both passes are fully convolutional: rgb<->lab, threshold, avg_pool
-(area), max_pool (reach), separable gaussian, pointwise.
-
-  forward(rgb): (N,H,W,3) uint8 -> (N,H,W,3) uint8   (norm/transpose baked in)
-"""
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import geometry
-from defringe_numpy import GREEN_CAST, PURPLE_CAST, RED_REF, GREEN_REF, MAGENTA_REF
+from defringe_numpy import RED_REF, GREEN_REF, MAGENTA_REF
+from parameters import GREEN_DEFAULTS, PURPLE_DEFAULTS
 
-# skimage-matching colour constants (sRGB, D65/2deg)
+TRUST_FLOOR = 1e-3
+
+# sRGB / CIELAB constants (D65, 2°) matching skimage.
 _XYZ_FROM_RGB = np.array([[0.412453, 0.357580, 0.180423],
                           [0.212671, 0.715160, 0.072169],
                           [0.019334, 0.119193, 0.950227]], np.float64)
@@ -33,50 +18,109 @@ _REF_WHITE = np.array([0.95047, 1.0, 1.08883], np.float64)
 _LAB_EPS, _LAB_KAPPA, _LAB_OFF = 0.008856, 7.787, 16.0 / 116.0
 
 
-def _gauss1d(sigma, truncate=4.0):
-    if sigma <= 0:                                  # no blur (cf. numpy feather=0):
-        return torch.ones(1, 1, 1, 1), 0           # 1-tap identity kernel, radius 0
-    r = max(1, int(truncate * sigma + 0.5))
-    xs = torch.arange(-r, r + 1, dtype=torch.float32)
-    k = torch.exp(-(xs ** 2) / (2.0 * sigma * sigma))
-    return (k / k.sum()).view(1, 1, 1, -1), r
-
-
 class Defringe(nn.Module):
-    """green_cast -> purple_cast, ONNX-able. uint8 NHWC in/out."""
 
     def __init__(self, green=None, purple=None, ref_hw=(1080, 1920)):
         super().__init__()
-        # Spatial params arrive resolution-relative (see defringe_numpy.cast_defringe);
-        # convert to px for a reference resolution since ONNX kernel sizes are constants.
         _H, _W = ref_hw
-        self.g = geometry.relative_to_px({**GREEN_CAST, **(green or {})}, _H, _W)
-        self.p = geometry.relative_to_px({**PURPLE_CAST, **(purple or {})}, _H, _W)
-        self.ref_diag = (_W * _W + _H * _H) ** 0.5     # reference diagonal the kernels are baked for
+        green, purple = green or {}, purple or {}
+        self.g = geometry.relative_to_px({**GREEN_DEFAULTS, **green}, _H, _W)
+        self.p = geometry.relative_to_px({**PURPLE_DEFAULTS, **purple}, _H, _W)
+        self.ref_diag = (_W * _W + _H * _H) ** 0.5
         self.register_buffer("xyz_from_rgb", torch.tensor(_XYZ_FROM_RGB, dtype=torch.float32))
         self.register_buffer("rgb_from_xyz", torch.tensor(_RGB_FROM_XYZ, dtype=torch.float32))
         self.register_buffer("ref_white", torch.tensor(_REF_WHITE, dtype=torch.float32))
         for tag, P in (("g", self.g), ("p", self.p)):
-            for nm, sig in (("feather", P["feather"]),
-                            ("tone", P["tone_correction_radius"]),
-                            ("reach", max(P["radius_softness"] * P["cast_radius"] * geometry.REACH_FEATHER_CALIB, 1e-3))):
-                k, r = _gauss1d(sig)
-                self.register_buffer(f"k_{tag}_{nm}", k)
-                setattr(self, f"r_{tag}_{nm}", r)
-            # Box-sum window for the area test (must hold ~min_area px). We test a
-            # local bright-pixel COUNT, matching numpy's connected-component AREA
-            # threshold, instead of a morphological opening — an opening needs a
-            # solid k×k square to survive and so erased thin highlight rims, the
-            # dominant casters for axial-CA purple fringe (heavy under-correction).
+            for name, sigma in (("feather", P["feather"]),
+                                ("tone", P["tone_correction_radius"]),
+                                ("reach", max(P["radius_softness"] * P["cast_radius"] * geometry.REACH_FEATHER_CALIB, 1e-3))):
+                kernel, radius = gaussian_1d(sigma)
+                self.register_buffer(f"k_{tag}_{name}", kernel)
+                setattr(self, f"r_{tag}_{name}", radius)
             setattr(self, f"areaw_{tag}", geometry.area_window(P["min_area"]))
 
-    # ---- colour ----
-    def _mm(self, x, m):
-        return torch.einsum("ij,njhw->nihw", m, x)
+    def forward(self, rgb):
+        x = rgb.permute(0, 3, 1, 2).to(torch.float32) / 255.0
+        # Resolution-invariant: kernel sizes are baked for ref_hw, so run the pipeline at the
+        # reference diagonal and resize the correction *delta* back (not the frame), which keeps
+        # untouched detail and is exact at ref_hw where the resizes are no-ops.
+        shape = torch._shape_as_tensor(x).to(torch.float32)
+        scale = self.ref_diag / torch.sqrt(shape[2] * shape[2] + shape[3] * shape[3] + 1e-12)
+        ref_h = (shape[2] * scale).round().clamp(min=1.0).to(torch.int64)
+        ref_w = (shape[3] * scale).round().clamp(min=1.0).to(torch.int64)
+        resampled = F.interpolate(x, size=[ref_h, ref_w], mode="bilinear", align_corners=False)
+        delta = self._pipeline(resampled) - resampled
+        full = torch._shape_as_tensor(x)
+        delta = F.interpolate(delta, size=[full[2], full[3]], mode="bilinear", align_corners=False)
+        return ((x + delta).clamp(0.0, 1.0) * 255.0).round().permute(0, 2, 3, 1).to(torch.uint8)
+
+    def _pipeline(self, x):
+        lab = self.rgb2lab(x)
+        a, b = lab[:, 1:2], lab[:, 2:3]
+        hue, chroma = to_polar(a, b)
+        g = self.g
+        casters = ((chroma > g["caster_min_chroma"]) & in_band(signed_hue_offset(hue, RED_REF), g["caster_hue_lo"], g["caster_hue_hi"])).float()
+        fringe = ((chroma > g["fringe_min_chroma"]) & in_band(signed_hue_offset(hue, GREEN_REF), g["fringe_hue_lo"], g["fringe_hue_hi"])).float()
+        strength = ramp(chroma, g["fringe_min_chroma"], g["full_strength_span"])
+        green_out, green_keep = self._pass(lab, g, "g", casters, fringe, strength)
+        blended = green_keep * green_out + (1.0 - green_keep) * x
+
+        lab = self.rgb2lab(blended)
+        L, a, b = lab[:, 0:1], lab[:, 1:2], lab[:, 2:3]
+        _, chroma = to_polar(a, b)
+        p = self.p
+        casters = (L > p["caster_min_lightness"]).float()
+        scene_a, scene_b = scene_tone(L, a, b, p["caster_min_lightness"])
+        excess_a, excess_b = a - scene_a, b - scene_b
+        excess = (excess_a * excess_a + excess_b * excess_b).clamp_min(0).sqrt()
+        off_target = angle_from_axis(excess_a, excess_b, np.radians(MAGENTA_REF + p["target_hue"]))
+        within_cone = soft_within(off_target, p["hue_halfwidth"] + 1e-6, p["hue_softness"])
+        fringe = ((chroma > p["fringe_min_chroma"]) & (excess > p["excess_thresh"]) & (within_cone > 0)).float()
+        strength = ramp(excess, p["excess_thresh"], p["full_strength_span"]) * within_cone
+        purple_out, purple_keep = self._pass(lab, p, "p", casters, fringe, strength)
+        return purple_keep * purple_out + (1.0 - purple_keep) * blended
+
+    def _pass(self, lab, P, tag, casters, fringe, strength):
+        L, a, b = lab[:, 0:1], lab[:, 1:2], lab[:, 2:3]
+        caster_field = self._survive_min_area(casters, P, tag)
+        reach = self._cast_reach(caster_field, P, tag)
+        shadow = fringe * reach * (1.0 - caster_field)
+        alpha = self._feathered_alpha(shadow * strength.clamp(0, 1), P, tag)
+        image = self._repair_chroma(L, a, b, alpha, reach, P, tag)
+        return image, (alpha > 0).float()
+
+    def _survive_min_area(self, casters, P, tag):
+        window = getattr(self, f"areaw_{tag}")
+        neighbours = F.avg_pool2d(casters, window, stride=1, padding=window // 2) * float(window * window)
+        min_area = float(P["min_area"])
+        softness = float(P["area_softness"]) * min_area
+        if softness > 0:
+            return casters * smoothstep(min_area - softness, min_area + softness, neighbours)
+        return casters * (neighbours >= min_area).float()
+
+    def _cast_reach(self, caster_field, P, tag):
+        radius = max(1, int(round(P["cast_radius"] * geometry.REACH_CALIB)))
+        dilated = self._dilate(caster_field, 2 * radius + 1)
+        return self._blur(dilated, tag, "reach").clamp(0, 1)
+
+    def _feathered_alpha(self, seed, P, tag):
+        spread = int(round(P["repair_spread"]))
+        grown = self._dilate(seed, 2 * spread + 1)
+        return self._blur(grown, tag, "feather").clamp(0, P["max_opacity"])
+
+    def _repair_chroma(self, L, a, b, alpha, reach, P, tag):
+        trust = ((1.0 - alpha) + TRUST_FLOOR) * (1.0 - P["tone_directionality"] * reach)
+        denom = self._blur(trust, tag, "tone")
+        tone_a = safe_divide(self._blur(a * trust, tag, "tone"), denom)
+        tone_b = safe_divide(self._blur(b * trust, tag, "tone"), denom)
+        corrected = torch.cat([L, lerp(a, tone_a, alpha), lerp(b, tone_b, alpha)], 1)
+        return self.lab2rgb(corrected)
+
+    # ── colour ───────────────────────────────────────────────────────────────
 
     def rgb2lab(self, rgb):
-        lin = torch.where(rgb > 0.04045, ((rgb.clamp(min=0) + 0.055) / 1.055) ** 2.4, rgb / 12.92)
-        xyz = self._mm(lin, self.xyz_from_rgb) / self.ref_white.view(1, 3, 1, 1)
+        linear = torch.where(rgb > 0.04045, ((rgb.clamp(min=0) + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+        xyz = self._apply_matrix(linear, self.xyz_from_rgb) / self.ref_white.view(1, 3, 1, 1)
         f = torch.where(xyz > _LAB_EPS, xyz.clamp(min=0) ** (1.0 / 3.0), _LAB_KAPPA * xyz + _LAB_OFF)
         fx, fy, fz = f[:, 0:1], f[:, 1:2], f[:, 2:3]
         return torch.cat([116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)], 1)
@@ -86,125 +130,84 @@ class Defringe(nn.Module):
         fy = (L + 16.0) / 116.0
         fx, fz = fy + a / 500.0, fy - b / 200.0
         f = torch.cat([fx, fy, fz], 1)
-        f3 = f ** 3
-        xyz = torch.where(f3 > _LAB_EPS, f3, (f - _LAB_OFF) / _LAB_KAPPA) * self.ref_white.view(1, 3, 1, 1)
-        lin = self._mm(xyz, self.rgb_from_xyz)
-        srgb = torch.where(lin > 0.0031308, 1.055 * lin.clamp(min=0) ** (1.0 / 2.4) - 0.055, 12.92 * lin)
+        cubed = f ** 3
+        xyz = torch.where(cubed > _LAB_EPS, cubed, (f - _LAB_OFF) / _LAB_KAPPA) * self.ref_white.view(1, 3, 1, 1)
+        linear = self._apply_matrix(xyz, self.rgb_from_xyz)
+        srgb = torch.where(linear > 0.0031308, 1.055 * linear.clamp(min=0) ** (1.0 / 2.4) - 0.055, 12.92 * linear)
         return srgb.clamp(0.0, 1.0)
 
-    # ---- morphology / blur ----
+    def _apply_matrix(self, x, matrix):
+        return torch.einsum("ij,njhw->nihw", matrix, x)
+
+    # ── morphology / blur ──────────────────────────────────────────────────────
+
     @staticmethod
     def _dilate(x, k):
         return F.max_pool2d(x, k, stride=1, padding=k // 2)
 
-    def _erode(self, x, k):
-        return 1.0 - self._dilate(1.0 - x, k)
+    def _blur(self, x, tag, name):
+        kernel, radius = getattr(self, f"k_{tag}_{name}"), getattr(self, f"r_{tag}_{name}")
+        x = F.conv2d(F.pad(x, (radius, radius, 0, 0), mode="reflect"), kernel)
+        return F.conv2d(F.pad(x, (0, 0, radius, radius), mode="reflect"), kernel.transpose(2, 3))
 
-    def _sep(self, x, k1d, r):
-        x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="reflect"), k1d)
-        x = F.conv2d(F.pad(x, (0, 0, r, r), mode="reflect"), k1d.transpose(2, 3))
-        return x
 
-    def _pass(self, lab, P, tag, caster, shadow, strength):
-        # `shadow` (candidate mask) and `strength` (alpha ramp, pre-clamp) are computed
-        # per-detector in forward(); everything from morphology on is shared.
-        L, a, b = lab[:, 0:1], lab[:, 1:2], lab[:, 2:3]
-        # Minimum Area as a local bright-pixel COUNT (box-sum via avg_pool), softened
-        # near the threshold for temporal stability (cf. numpy soft_step on blob area).
-        w = getattr(self, f"areaw_{tag}")
-        dens = F.avg_pool2d(caster, w, stride=1, padding=w // 2) * float(w * w)
-        ma, aw = float(P["min_area"]), float(P["area_softness"]) * float(P["min_area"])
-        if aw > 0:
-            t = ((dens - ma) / (2.0 * aw) + 0.5).clamp(0, 1)
-            co = caster * (t * t * (3.0 - 2.0 * t))                          # ~ Minimum Area
-        else:
-            co = caster * (dens >= ma).float()
-        R = max(1, int(round(P["cast_radius"] * geometry.REACH_CALIB)))      # match numpy reach calib
-        reach = self._sep(self._dilate(co, 2 * R + 1),                       # ~ Cast Reach
-                          getattr(self, f"k_{tag}_reach"), getattr(self, f"r_{tag}_reach")).clamp(0, 1)
-        keepS = shadow * reach * (1.0 - co)
-        abase = keepS * strength.clamp(0, 1)
-        sp = int(round(P["repair_spread"]))
-        if sp > 0:
-            abase = self._dilate(abase, 2 * sp + 1)
-        alpha = self._sep(abase, getattr(self, f"k_{tag}_feather"),
-                          getattr(self, f"r_{tag}_feather")).clamp(0, P["max_opacity"])
-        # directional repair (cf. numpy `donor`): down-weight tone donors on the
-        # caster side. `reach` approximates caster-nearness (~1 over the caster and
-        # its reach, ~0 on the clean down-cast side), so multiplying it out of the
-        # trust biases the tone estimate away from the source. dir=0 -> unchanged.
-        trust = (1.0 - alpha) + 1e-3
-        if P["tone_directionality"] > 0:
-            trust = trust * (1.0 - P["tone_directionality"] * reach)
-        kt, rt = getattr(self, f"k_{tag}_tone"), getattr(self, f"r_{tag}_tone")
-        den = self._sep(trust, kt, rt) + 1e-6
-        ta = self._sep(a * trust, kt, rt) / den
-        tb = self._sep(b * trust, kt, rt) / den
-        out = self.lab2rgb(torch.cat([L, a + alpha * (ta - a), b + alpha * (tb - b)], 1))
-        keep = (alpha > 0).float()
-        return out, keep
+# ── maths (torch twins of the defringe_numpy helpers) ─────────────────────────
 
-    def _pipeline(self, x):                           # float NCHW [0,1] -> corrected float NCHW [0,1]
-        lab = self.rgb2lab(x)
-        a, b = lab[:, 1:2], lab[:, 2:3]
-        chroma = torch.sqrt(a * a + b * b + 1e-12)
-        hue = (torch.atan2(b, a) * (180.0 / np.pi)) % 360.0
-        hs = ((hue - RED_REF + 180.0) % 360.0) - 180.0
-        gcaster = ((chroma > self.g["caster_min_chroma"]) & (hs >= self.g["caster_hue_lo"]) & (hs <= self.g["caster_hue_hi"])).float()
-        # green shadow: absolute teal-green hue band; strength ramps on chroma
-        gs = ((hue - GREEN_REF + 180.0) % 360.0) - 180.0
-        gshadow = ((chroma > self.g["fringe_min_chroma"]) & (gs >= self.g["fringe_hue_lo"]) & (gs <= self.g["fringe_hue_hi"])).float()
-        gstrength = ((chroma - self.g["fringe_min_chroma"]) / max(self.g["full_strength_span"], 1e-3)).clamp(0, 1)
-        gout, gkeep = self._pass(lab, self.g, "g", gcaster, gshadow, gstrength)
-        gx = gkeep * gout + (1.0 - gkeep) * x                       # composite green
+def smoothstep(lo, hi, x):
+    t = ((x - lo) / (hi - lo)).clamp(0, 1)
+    return t * t * (3.0 - 2.0 * t)
 
-        lab2 = self.rgb2lab(gx)
-        L2, a2, b2 = lab2[:, 0:1], lab2[:, 1:2], lab2[:, 2:3]
-        chroma2 = torch.sqrt(a2 * a2 + b2 * b2 + 1e-12)
-        pcaster = (L2 > self.p["caster_min_lightness"]).float()
-        # purple shadow: magenta EXCESS over the scene's global lighting tone (warm<->cool),
-        # measured along target_hue; strength ramps on that excess. The reference is the
-        # luminance-weighted mean of a*/b* over lit, non-clipped pixels, reduced per-frame
-        # (keepdim over H,W) -> matches numpy's global (a_ref,b_ref).
-        th = np.radians(MAGENTA_REF + self.p["target_hue"])
-        um_a, um_b = float(np.cos(th)), float(np.sin(th))
-        wmask = L2 * (L2 < self.p["caster_min_lightness"]).float()
-        wsum = wmask.sum(dim=(2, 3), keepdim=True) + 1e-6
-        a_ref = (wmask * a2).sum(dim=(2, 3), keepdim=True) / wsum
-        b_ref = (wmask * b2).sum(dim=(2, 3), keepdim=True) / wsum
-        ex_a, ex_b = a2 - a_ref, b2 - b_ref
-        mproj = ex_a * um_a + ex_b * um_b                              # signed projection: angular gate only
-        mexcess = (ex_a * ex_a + ex_b * ex_b).clamp_min(0).sqrt()    # RADIAL distance from the scene tone (hypot; ONNX-safe)
-        # angular gate: accept only excess hues within +-hue_halfwidth of the target
-        # direction (mirrors purple_cast.py). soft_step smoothstep feathers the edge.
-        perp = -ex_a * um_b + ex_b * um_a
-        ang = torch.atan2(perp.abs(), mproj) * (180.0 / np.pi)         # 0 = on target hue
-        hw, hsoft = self.p["hue_halfwidth"] + 1e-6, self.p["hue_softness"]
-        if hsoft > 0:
-            t = ((-ang - (-hw)) / (2.0 * hsoft) + 0.5).clamp(0, 1)
-            hue_w = t * t * (3.0 - 2.0 * t)
-        else:
-            hue_w = (ang < hw).float()
-        pshadow = ((chroma2 > self.p["fringe_min_chroma"]) & (mexcess > self.p["excess_thresh"]) & (hue_w > 0)).float()
-        pstrength = (((mexcess - self.p["excess_thresh"]) / max(self.p["full_strength_span"], 1e-3)).clamp(0, 1)) * hue_w
-        pout, pkeep = self._pass(lab2, self.p, "p", pcaster, pshadow, pstrength)
-        px = pkeep * pout + (1.0 - pkeep) * gx                      # composite purple
-        return px
 
-    def forward(self, rgb):                            # (N,H,W,3) uint8 -> (N,H,W,3) uint8
-        x0 = rgb.permute(0, 3, 1, 2).to(torch.float32) / 255.0
-        # Resolution invariance: the kernel sizes are baked for ref_hw, so resample the frame to
-        # the reference diagonal (aspect-preserving), run the pipeline there, resize the correction
-        # delta back, and add it to the original -- untouched detail is preserved (the delta is ~0
-        # there) and the geometry is right at any input size. At the reference size scale==1, the
-        # resizes are exact no-ops, so it stays bit-for-bit identical to the in-place pipeline.
-        shp = torch._shape_as_tensor(x0).to(torch.float32)
-        scale = self.ref_diag / torch.sqrt(shp[2] * shp[2] + shp[3] * shp[3] + 1e-12)
-        ch = (shp[2] * scale).round().clamp(min=1.0).to(torch.int64)
-        cw = (shp[3] * scale).round().clamp(min=1.0).to(torch.int64)
-        xc = F.interpolate(x0, size=[ch, cw], mode="bilinear", align_corners=False)
-        delta = self._pipeline(xc) - xc
-        shp0 = torch._shape_as_tensor(x0)
-        delta = F.interpolate(delta, size=[shp0[2], shp0[3]], mode="bilinear", align_corners=False)
-        y = ((x0 + delta).clamp(0.0, 1.0) * 255.0).round()
-        return y.permute(0, 2, 3, 1).to(torch.uint8)
+def soft_within(off_target, halfwidth, softness):
+    if softness > 0:
+        return smoothstep(-halfwidth - softness, -halfwidth + softness, -off_target)
+    return (off_target < halfwidth).float()
+
+
+def lerp(start, end, t):
+    return start + t * (end - start)
+
+
+def ramp(value, threshold, span):
+    return ((value - threshold) / max(span, 1e-3)).clamp(0, 1)
+
+
+def in_band(x, lo, hi):
+    return (x >= lo) & (x <= hi)
+
+
+def signed_hue_offset(hue, reference):
+    return ((hue - reference + 180.0) % 360.0) - 180.0
+
+
+def to_polar(a, b):
+    hue = (torch.atan2(b, a) * (180.0 / np.pi)) % 360.0
+    chroma = torch.sqrt(a * a + b * b + 1e-12)
+    return hue, chroma
+
+
+def angle_from_axis(vec_a, vec_b, axis_rad):
+    axis_a, axis_b = float(np.cos(axis_rad)), float(np.sin(axis_rad))
+    along = vec_a * axis_a + vec_b * axis_b
+    across = -vec_a * axis_b + vec_b * axis_a
+    return torch.atan2(across.abs(), along) * (180.0 / np.pi)
+
+
+def scene_tone(L, a, b, blown):
+    lit = L * (L < blown).float()
+    weight = lit.sum(dim=(2, 3), keepdim=True)
+    return (safe_divide((lit * a).sum(dim=(2, 3), keepdim=True), weight),
+            safe_divide((lit * b).sum(dim=(2, 3), keepdim=True), weight))
+
+
+def safe_divide(numerator, denominator):
+    return numerator / (denominator + 1e-6)
+
+
+def gaussian_1d(sigma, truncate=4.0):
+    if sigma <= 0:
+        return torch.ones(1, 1, 1, 1), 0
+    radius = max(1, int(truncate * sigma + 0.5))
+    offsets = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    kernel = torch.exp(-(offsets ** 2) / (2.0 * sigma * sigma))
+    return (kernel / kernel.sum()).view(1, 1, 1, -1), radius
