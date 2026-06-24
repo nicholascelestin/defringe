@@ -14,7 +14,9 @@ function readDefaults() {
 
 // ── one home for "read / write / commit a Gradio slider" (each has both a range and a number input) ──
 function readSlider(id) {
-  const input = document.querySelector('#' + id + ' input[type=range], #' + id + ' input[type=number]');
+  const block = document.getElementById(id);
+  // prefer the range input: it holds the live drag value before Gradio syncs the number input
+  const input = block && (block.querySelector('input[type=range]') || block.querySelector('input[type=number]'));
   if (!input) return null;
   return { value: parseFloat(input.value), min: parseFloat(input.min), max: parseFloat(input.max), step: parseFloat(input.step) || 1 };
 }
@@ -36,7 +38,7 @@ function commitSlider(id) {
 function bindWheel(el, sliderFor) {                        // sliderFor: wheel param key -> slider elem_id
   const keys = Object.keys(sliderFor);
   const sliderIds = Object.values(sliderFor);
-  const ownsSlider = (elemId) => sliderIds.indexOf(elemId) !== -1;
+  const ownedSliders = sliderIds.map((id) => '#' + id).join(',');   // selector for the wheel's slider blocks
   let applying = false;                                   // set only while WE write a slider, so our writes skip the input watcher
 
   // No value-dedup: the wheel local-echoes drags, so a snapshot matching a stale cache must still
@@ -59,11 +61,11 @@ function bindWheel(el, sliderFor) {                        // sliderFor: wheel p
     snapshot();                                           // reset bypasses the wheel's local echo
   }));
 
-  // External slider changes (↺ reset, etc.) re-snapshot -> repaint; our own writes are skipped via `applying`.
+  // External slider changes (drag, ↺ reset, etc.) re-snapshot -> repaint; our own writes are skipped
+  // via `applying`. Match the slider BLOCK, not closest('[id]') — Gradio's range input has its own id.
   document.addEventListener('input', (e) => {
     if (applying) return;
-    const block = e.target.closest && e.target.closest('[id]');
-    if (block && ownsSlider(block.id)) snapshot();
+    if (ownedSliders && e.target.closest && e.target.closest(ownedSliders)) snapshot();
   }, true);
 
   // Re-snapshot when the SET of present sliders changes (late mount, tab detach/reattach). Keyed on

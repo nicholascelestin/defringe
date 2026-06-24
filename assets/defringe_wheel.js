@@ -216,17 +216,17 @@ class DefringeWheel extends HTMLElement {
     const spreadRadius = baseRadius + growRadius(spread, spreadMax, spreadGapMax);
     const featherRadius = spreadRadius + growRadius(feather, featherMax, featherGapMax);
     const green = '#157347', channels = '21,115,71';
-    this.#title('repair strength, spread, & feather', blob.x);
+    this.#title('repair spread, strength, & feather', blob.x);
     this.#featherRings(blob, featherRadius, channels);
     this.#pen.dot(blob, spreadRadius, `rgba(${channels},0.4)`, `rgba(${channels},0.7)`, 1);
     const levelY = this.#fillGauge(blob, baseRadius, strength, channels);
     const h = this.#blobHandles(blob, green);
     const strengthHandle = h.level({ id: repair.strength, value: strength, radius: baseRadius, at: { x: blob.x, y: levelY } });
-    const spreadHandle = h.gap({ id: repair.spread, value: spread, inner: baseRadius, valueMax: spreadMax, radiusMax: spreadGapMax, at: polar(blob, -0.28 * Math.PI, spreadRadius) });
-    const featherHandle = h.gap({ id: repair.feather, value: feather, inner: spreadRadius, valueMax: featherMax, radiusMax: featherGapMax, at: polar(blob, 0.30 * Math.PI, featherRadius) });
-    this.#callout(strengthHandle, blob.x - 44, DISC_BOX + 30, 'end', { decimals: 2 });
-    this.#callout(spreadHandle, blob.x + 50, DISC_BOX + 30, 'start', { decimals: 2 });
-    this.#callout(featherHandle, blob.x + 56, blob.y + 24, 'start', { decimals: 2 });
+    const spreadHandle = h.gap({ id: repair.spread, value: spread, inner: baseRadius, valueMax: spreadMax, radiusMax: spreadGapMax, at: polar(blob, Math.PI, spreadRadius) });
+    const featherHandle = h.gap({ id: repair.feather, value: feather, inner: spreadRadius, valueMax: featherMax, radiusMax: featherGapMax, at: polar(blob, 0, featherRadius) });
+    this.#callout(spreadHandle, blob.x - 50, DISC_BOX + 30, 'right', { decimals: 2 });
+    this.#callout(strengthHandle, blob.x, DISC_BOX + 30, 'center', { decimals: 2 });
+    this.#callout(featherHandle, blob.x + 50, DISC_BOX + 30, 'left', { decimals: 2 });
   }
 
   // ── gauges (generic pen verbs, coloured here where the meaning lives) ──

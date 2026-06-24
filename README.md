@@ -2,6 +2,18 @@
 
 Removes green and purple fringe from videos, touching just the chroma channels.
 
+## Before / After
+
+Equal 300 px crops from the sample stills, each centred on its densest fringe (found from the
+algorithm's own correction map). Green pass then purple, default settings. Red arrows in some frames
+are source-image markers sitting on the fringe.
+
+| | Before | After |
+| --- | --- | --- |
+| **people** | <img src="docs/crops/people_before.png" width="280" alt="people, before"> | <img src="docs/crops/people_after.png" width="280" alt="people, after"> |
+| **horses** | <img src="docs/crops/horses_before.png" width="280" alt="horses, before"> | <img src="docs/crops/horses_after.png" width="280" alt="horses, after"> |
+| **inside** | <img src="docs/crops/inside_before.png" width="280" alt="inside, before"> | <img src="docs/crops/inside_after.png" width="280" alt="inside, after"> |
+
 ## Algorithms
 
 Fringe is a **shadow cast by a source**. First, find all the sources ("casters"). Then, find all the nearby fringe ("shadows"). Then, pull that chroma towards the clean, local tone.
@@ -12,6 +24,48 @@ Fringe is a **shadow cast by a source**. First, find all the sources ("casters")
 Green fringe can be cast by purple fringe. If you remove purple fringe first, the green fringe it casts will be orphaned (without a caster), and will be unable to be removed by the green fringe algorithm. So, run green first, then purple.
 
 `defringe_numpy.py` is the canonical numpy implementation; `defringe_torch.py` is its ONNX-exportable twin (convolutions in place of scipy's `label`/EDT). They share `geometry.py` (the resolution-relative → pixel conversion and reach/area calibration) so the two can't drift; `tests/` pins the twin to the reference.
+
+## Walkthrough
+
+Five tabs: load a clip, tune each pass on a colour wheel, check it holds over time, export ONNX.
+
+**0 · Source** — point at a video, extract a few seconds into memory.
+
+<p align="center"><img src="docs/import.png" width="380" alt="Source tab"></p>
+
+**Overlays** — see what each pass touches: the casters and their reach, and the correction alpha.
+
+<table>
+<tr>
+<td align="center"><img src="docs/casters.png" width="400" alt="casters and reach overlay"></td>
+<td align="center"><img src="docs/alpha.png" width="400" alt="correction alpha overlay"></td>
+</tr>
+<tr>
+<td align="center"><sub>casters &amp; reach</sub></td>
+<td align="center"><sub>alpha</sub></td>
+</tr>
+</table>
+
+**1–2 · Green & Purple** — drag the *Casters* and *Shadows* wedges; the sliders below mirror the handles.
+
+<table>
+<tr>
+<td align="center"><img src="docs/green_settings.png" width="380" alt="green pass colour wheel"></td>
+<td align="center"><img src="docs/purple_settings.png" width="380" alt="purple pass colour wheel"></td>
+</tr>
+<tr>
+<td align="center"><sub>green pass</sub></td>
+<td align="center"><sub>purple pass</sub></td>
+</tr>
+</table>
+
+**3 · Temporal** — scrub corrected frames; the flicker heatmap flags shimmer.
+
+<p align="center"><img src="docs/temporal.png" width="640" alt="Temporal Analysis tab"></p>
+
+**4 · Run** — bake settings into a portable ONNX model, run it over the clip or the whole video.
+
+<p align="center"><img src="docs/run.png" width="640" alt="Run tab"></p>
 
 ## Layout
 
@@ -33,7 +87,8 @@ assets/               frontend: defringe_wheel.js, gradio_ui.js, acc.css
 model/                cast_defringe.onnx — exported model (uint8 RGB in/out, dynamic N/H/W)
 colab_defringe.ipynb  GPU runner: ONNX over a whole video, colour-correct encode
 tests/                numpy ↔ torch/ONNX conformance (mean/p99 tolerance)
-samples/              sample stills + clip
+samples/              sample stills + clip used by the app
+docs/                 README screenshots; crops/ holds the before/after squares
 ```
 
 ## Quickstart
