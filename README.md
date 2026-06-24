@@ -2,18 +2,6 @@
 
 Removes green and purple fringe from videos, touching just the chroma channels.
 
-## Before / After
-
-Equal 300 px crops from the sample stills, each centred on its densest fringe (found from the
-algorithm's own correction map). Green pass then purple, default settings. Red arrows in some frames
-are source-image markers sitting on the fringe.
-
-| | Before | After |
-| --- | --- | --- |
-| **people** | <img src="docs/crops/people_before.png" width="280" alt="people, before"> | <img src="docs/crops/people_after.png" width="280" alt="people, after"> |
-| **horses** | <img src="docs/crops/horses_before.png" width="280" alt="horses, before"> | <img src="docs/crops/horses_after.png" width="280" alt="horses, after"> |
-| **inside** | <img src="docs/crops/inside_before.png" width="280" alt="inside, before"> | <img src="docs/crops/inside_after.png" width="280" alt="inside, after"> |
-
 ## Algorithms
 
 Fringe is a **shadow cast by a source**. First, find all the sources ("casters"). Then, find all the nearby fringe ("shadows"). Then, pull that chroma towards the clean, local tone.
