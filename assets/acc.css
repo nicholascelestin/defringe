@@ -11,10 +11,10 @@
   font-size:var(--block-title-text-size,14px);font-weight:var(--block-title-text-weight,400);}
 .acc-head .chev{font-size:14px;transition:transform .15s ease;transform:rotate(90deg);}
 .acc-head.open .chev{transform:rotate(0deg);}
-/* Graceful degradation: default-open so the sliders are usable with NO JS. gradio_ui.js sets
-   html.js up front, which is what actually collapses the panels — so JS off => everything open
-   and reachable (vanilla Gradio), JS on => collapsible exactly as before (no flash). */
-.acc-body{display:block;}
-html.js .acc-body{display:none;}
-html.js .acc-body.open{display:block;}
+/* Collapsed by default; gradio_ui.js toggles `.open` on the panel (and its header) to expand.
+   The state class must live on the panel itself: Gradio scopes injected CSS by prefixing every
+   selector with `.gradio-container … .contain`, so an `html`-level gate is rewritten to
+   `… .contain html …` and can never match. (Gradio is a JS-only SPA — no no-JS state to keep.) */
+.acc-body{display:none;}
+.acc-body.open{display:block;}
 .hidden-blob{display:none !important;}   /* mounted (so the reset glue can read it) but invisible */

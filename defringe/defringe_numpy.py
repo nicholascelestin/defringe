@@ -5,8 +5,8 @@ from numpy.typing import NDArray
 from skimage.color import rgb2lab, lab2rgb
 from scipy.ndimage import gaussian_filter, maximum_filter, uniform_filter
 
-import geometry
-from parameters import GREEN_DEFAULTS, PURPLE_DEFAULTS
+from . import geometry
+from .parameters import GREEN_DEFAULTS, PURPLE_DEFAULTS
 
 __all__ = ["defringe", "green_cast", "purple_cast", "Cast",
            "RED_REF", "GREEN_REF", "MAGENTA_REF"]

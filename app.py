@@ -12,15 +12,15 @@ matplotlib.use("Agg")
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 
-import video_io
-import onnx_runtime
-import views
-import parameters
-import defringe_numpy as alg
-from sliders import slider, GREEN_REG, PURPLE_REG, REG, split, export_profile, import_profile
+from defringe import video_io
+from defringe import onnx_runtime
+from defringe import views
+from defringe import parameters
+from defringe import defringe_numpy as alg
+from defringe.sliders import slider, GREEN_REG, PURPLE_REG, REG, split, export_profile, import_profile
 
 DEFAULT_SECS = 10
-ONNX_PATH = "cast_defringe.onnx"
+ONNX_PATH = Path(__file__).with_name("model") / "cast_defringe.onnx"
 ONNX_PREVIEW = "onnx_preview.mp4"
 TEMPORAL_N = 6
 STATIC_MOTION = 2.0     # input barely moved between frames (per-channel mean |Δ|, 0-255 levels)
@@ -224,7 +224,7 @@ def export_onnx(still, clip, idx, g_on, pc_on, *vals, progress=gr.Progress()):
     progress(0.05, desc="loading torch...")
     try:
         import torch
-        from defringe_torch import Defringe
+        from defringe.defringe_torch import Defringe
     except Exception as e:
         return f"⚠️ torch not available — try `uv sync` to reinstall deps.\n\n`{e}`"
     green, purple = split(vals)
@@ -238,14 +238,15 @@ def export_onnx(still, clip, idx, g_on, pc_on, *vals, progress=gr.Progress()):
     model = Defringe(green=green, purple=purple, ref_hw=ref_hw).eval()
     dummy = torch.zeros(1, 540, 960, 3, dtype=torch.uint8)
     progress(0.55, desc="exporting ONNX (opset 17)...")
-    torch.onnx.export(model, dummy, ONNX_PATH, opset_version=17,
+    ONNX_PATH.parent.mkdir(exist_ok=True)
+    torch.onnx.export(model, dummy, str(ONNX_PATH), opset_version=17,
                       input_names=["rgb"], output_names=["out"],
                       dynamic_axes={"rgb": {0: "N", 1: "H", 2: "W"},
                                     "out": {0: "N", 1: "H", 2: "W"}}, dynamo=False)
     progress(1.0, desc="done")
     mb = os.path.getsize(ONNX_PATH) / 1e6
     off = ("" if g_on else " · green OFF") + ("" if pc_on else " · purple OFF")
-    return (f"✅ Exported **{ONNX_PATH}** ({mb:.2f} MB) from the current slider settings{off}. "
+    return (f"✅ Exported **{ONNX_PATH.name}** ({mb:.2f} MB) from the current slider settings{off}. "
             f"Resolution-invariant — resamples internally to a {ref_hw[1]}×{ref_hw[0]} reference "
             f"(exact there, near-exact at other sizes); dynamic N/H/W, uint8 in/out.")
 
@@ -291,9 +292,12 @@ def run_onnx(clip, fps, video_path, scope, progress=gr.Progress()):
 
 
 ASSETS = Path(__file__).with_name("assets")
-WHEEL_JS = (ASSETS / "defringe_wheel.js").read_text()
 GRADIO_UI_JS = (ASSETS / "gradio_ui.js").read_text()
 ACC_CSS = (ASSETS / "acc.css").read_text()
+# defringe_wheel.js is an ES module (imports ./geometry.js, ./colour.js, ./pen.js), so it can't be
+# inlined — it's served from the assets dir and loaded by URL. gradio_ui.js stays a classic inline
+# script (it only touches the registered element + window.*), so it keeps working unchanged.
+WHEEL_MODULE_URL = f"/gradio_api/file={ASSETS}/defringe_wheel.js"
 
 
 def acc_head(title, target):
@@ -452,8 +456,8 @@ with gr.Blocks(title="Defringe tuner") as demo:
                                          interactive=False, max_lines=1)
                 onnx_video = gr.Video(label="ONNX output", height=420)
 
-    green_wheel.value = f"<div class='defringe-wheel-mount' data-config='{views.green_wheel_config(GREEN_REG)}'></div>"
-    purple_wheel.value = f"<div class='defringe-wheel-mount' data-config='{views.purple_wheel_config(PURPLE_REG)}'></div>"
+    green_wheel.value = views.green_wheel_mount(GREEN_REG)
+    purple_wheel.value = views.purple_wheel_mount(PURPLE_REG)
 
     ins = [still_state, clip_state, t0_frame, g_on, pc_on,
            *[e["comp"] for e in GREEN_REG], *[e["comp"] for e in PURPLE_REG]]
@@ -498,4 +502,6 @@ with gr.Blocks(title="Defringe tuner") as demo:
 
 if __name__ == "__main__":
     demo.launch(server_name="127.0.0.1", server_port=7862, show_error=True, css=ACC_CSS,
-                head=f"<script>{WHEEL_JS}</script><script>{GRADIO_UI_JS}</script>")
+                allowed_paths=[str(ASSETS)],
+                head=f'<script type="module" src="{WHEEL_MODULE_URL}"></script>'
+                     f"<script>{GRADIO_UI_JS}</script>")

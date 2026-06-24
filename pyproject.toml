@@ -33,7 +33,7 @@ testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.uv]
-# This is an application with a flat module layout (defringe_algorithm.py, app.py,
-# video_io.py at the root), not an installable package — manage deps only,
-# don't try to build/install the project itself.
+# The library lives in the defringe/ package; app.py at the root is the launcher
+# (both put the root on sys.path, so `import defringe` resolves without installing).
+# This isn't a distributable package — manage deps only, don't build/install it.
 package = false

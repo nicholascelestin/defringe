@@ -17,7 +17,7 @@ def make_session(onnx_path):
     for provider in _available_providers():
         try:
             with_fallback = [provider] if provider == "CPUExecutionProvider" else [provider, "CPUExecutionProvider"]
-            session = ort.InferenceSession(onnx_path, providers=with_fallback)
+            session = ort.InferenceSession(str(onnx_path), providers=with_fallback)
             chosen = session.get_providers()[0]
             return session, PROVIDER_LABEL.get(chosen, chosen)
         except Exception as e:

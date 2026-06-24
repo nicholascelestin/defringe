@@ -16,23 +16,24 @@ Green fringe can be cast by purple fringe. If you remove purple fringe first, th
 ## Layout
 
 ```
-defringe_numpy.py   the domain logic (source of truth): green & purple casts,
-                    the shared cast engine, Lab/soft-step helpers — pure numpy/skimage
-defringe_torch.py   torch/ONNX twin — tracks the numpy reference
-geometry.py         resolution-relative → pixel conversion + reach/area calibration,
-                    shared by both twins so they can't drift
-app.py              Gradio tuner — layout + event wiring (controllers)
-parameters.py       the tunable-parameter spec: one Param row per knob (name, default,
-                    range, label, help) — the single source the rest projects from
-sliders.py          builds a Gradio slider per spec; the registry, persistence, profiles
-views.py            detection overlays + colour-wheel config (presentation)
-video_io.py         ffmpeg wrappers: decode clips/frames, stream-decode, encode
-onnx_runtime.py     ONNX Runtime device selection + session building
-assets/             frontend: defringe_wheel.js, gradio_ui.js, acc.css
-cast_defringe.onnx  exported model (uint8 RGB in/out, dynamic N/H/W)
+app.py                Gradio tuner — layout + event wiring (controllers); the launcher
+defringe/             the library package
+  defringe_numpy.py   the domain logic (source of truth): green & purple casts,
+                      the shared cast engine, Lab/soft-step helpers — pure numpy/skimage
+  defringe_torch.py   torch/ONNX twin — tracks the numpy reference
+  geometry.py         resolution-relative → pixel conversion + reach/area calibration,
+                      shared by both twins so they can't drift
+  parameters.py       the tunable-parameter spec: one Param row per knob (name, default,
+                      range, label, help) — the single source the rest projects from
+  sliders.py          builds a Gradio slider per spec; the registry, persistence, profiles
+  views.py            detection overlays + colour-wheel config (presentation)
+  video_io.py         ffmpeg wrappers: decode clips/frames, stream-decode, encode
+  onnx_runtime.py     ONNX Runtime device selection + session building
+assets/               frontend: defringe_wheel.js, gradio_ui.js, acc.css
+model/                cast_defringe.onnx — exported model (uint8 RGB in/out, dynamic N/H/W)
 colab_defringe.ipynb  GPU runner: ONNX over a whole video, colour-correct encode
-tests/              numpy ↔ torch/ONNX conformance (mean/p99 tolerance)
-source/             sample stills + clip
+tests/                numpy ↔ torch/ONNX conformance (mean/p99 tolerance)
+samples/              sample stills + clip
 ```
 
 ## Quickstart

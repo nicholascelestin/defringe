@@ -11,11 +11,11 @@ import numpy as np
 import pytest
 from PIL import Image
 
-import video_io
-import defringe_numpy as alg
+from defringe import video_io
+from defringe import defringe_numpy as alg
 
-STILLS = ["source/inside.webp", "source/horses.png",
-          "source/building.webp", "source/people.webp"]
+STILLS = ["samples/inside.webp", "samples/horses.png",
+          "samples/building.webp", "samples/people.webp"]
 MEAN_TOL, P99_TOL, MAX_TOL = 0.15, 1, 16    # max allowed mean / 99th-pct / single-channel |Δ|, in 0-255 levels
 INV_MEAN_TOL, INV_P99_TOL = 0.3, 4          # off-reference (resampled) match to the resolution-invariant numpy
 
@@ -32,7 +32,7 @@ def _within_tolerance(out, ref):
 @pytest.fixture(scope="module")
 def torch_model():
     torch = pytest.importorskip("torch")
-    from defringe_torch import Defringe
+    from defringe.defringe_torch import Defringe
     return torch, Defringe().eval()
 
 

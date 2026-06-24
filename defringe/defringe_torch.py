@@ -3,9 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import geometry
-from defringe_numpy import RED_REF, GREEN_REF, MAGENTA_REF
-from parameters import GREEN_DEFAULTS, PURPLE_DEFAULTS
+from . import geometry
+from .defringe_numpy import RED_REF, GREEN_REF, MAGENTA_REF
+from .parameters import GREEN_DEFAULTS, PURPLE_DEFAULTS
 
 TRUST_FLOOR = 1e-3
 

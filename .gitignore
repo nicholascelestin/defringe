@@ -8,9 +8,9 @@ trash/
 # per-user "save settings as default" overrides (written at runtime by app.py)
 user_defaults.json
 
-# Video media (source/*.mp4 is a symlink to a file outside the repo, and render
+# Video media (samples/*.mp4 is a symlink to a file outside the repo, and render
 # outputs like onnx_preview.mp4 are large build artefacts). Keep the small still
-# test fixtures (source/*.webp, *.png) tracked.
+# test fixtures (samples/*.webp, *.png) tracked.
 *.mp4
 *.mkv
 *.mov

@@ -4,7 +4,8 @@ import tempfile
 
 import gradio as gr
 
-DEFAULTS_FILE = Path(__file__).with_name("user_defaults.json")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULTS_FILE = PROJECT_ROOT / "user_defaults.json"
 
 
 def _load_saved():
